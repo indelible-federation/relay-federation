@@ -7,7 +7,7 @@
     "relay-bridge": "cli.js"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test --test-force-exit test/*.test.js"
   },
   "dependencies": {
     "@bsv/sdk": "^1.10.1",

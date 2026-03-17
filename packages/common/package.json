@@ -8,6 +8,7 @@
     ".": "./index.js",
     "./protocol": "./lib/protocol.js",
     "./crypto": "./lib/crypto.js",
+    "./derivation": "./lib/derivation.js",
     "./network": "./lib/network.js"
   },
   "scripts": {

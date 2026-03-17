@@ -117,6 +117,57 @@ async function backfillBeaconRegistry (registeredPubkeys, selfPubkey) {
   }
 }
 
+/**
+ * Discover registered bridges from the overlay directory on startup.
+ * Queries the overlay for this bridge's specific mesh topic and populates
+ * both the trust set (registeredPubkeys) and the seed peers list.
+ *
+ * Only discovers peers registered to the same meshId — prevents cross-mesh peering.
+ *
+ * @param {Set<string>} registeredPubkeys - Set to populate with trusted pubkeys
+ * @param {string} selfPubkey - Our own pubkey (skip self)
+ * @param {string} meshId - This bridge's mesh identifier
+ * @param {string} [overlayUrl] - Overlay node URL
+ * @returns {Promise<Array<{pubkeyHex: string, endpoint: string}>>} - discovered peers with dialable endpoints
+ */
+async function discoverFromOverlay (registeredPubkeys, selfPubkey, meshId, overlayUrl) {
+  const url = overlayUrl || 'http://127.0.0.1:3360'
+  const topic = `mesh:bridge:${meshId}`
+  const discoveredPeers = []
+
+  try {
+    const { DirectoryClient } = await import('@relay-federation/overlay/client')
+    const client = new DirectoryClient(url, { timeoutMs: 10000 })
+
+    const entries = await client.findByTopic(topic)
+
+    if (!entries || entries.length === 0) {
+      console.log(`  Overlay discovery: no entries for ${topic}`)
+      return discoveredPeers
+    }
+
+    for (const entry of entries) {
+      if (!entry.identityPubHex || entry.identityPubHex === selfPubkey) continue
+      registeredPubkeys.add(entry.identityPubHex)
+
+      // domain field contains the full WebSocket endpoint for mesh:bridge: tokens
+      if (entry.domain) {
+        discoveredPeers.push({
+          pubkeyHex: entry.identityPubHex,
+          endpoint: entry.domain
+        })
+      }
+    }
+
+    console.log(`  Overlay discovery: +${discoveredPeers.length} peers for ${topic}`)
+    console.log(`  Registry: ${registeredPubkeys.size} trusted pubkeys after overlay discovery`)
+  } catch (err) {
+    console.log(`  Overlay discovery: unavailable (${err.message}) — using beacon only`)
+  }
+
+  return discoveredPeers
+}
+
 switch (command) {
   case 'init':
     await cmdInit()
@@ -146,11 +197,11 @@ switch (command) {
     console.log('relay-bridge — Federated SPV relay mesh bridge\n')
     console.log('Commands:')
     console.log('  init        Generate bridge identity and config')
-    console.log('  register    Register this bridge on-chain')
+    console.log('  register    Register this bridge via SHIP token on the overlay')
     console.log('  start       Start the bridge server')
     console.log('  status      Show running bridge status')
     console.log('  fund        Import a funding transaction (raw hex)')
-    console.log('  deregister  Deregister this bridge from the mesh')
+    console.log('  deregister  Deregister this bridge (revoke SHIP token)')
     console.log('  secret      Show your operator secret for dashboard login')
     console.log('  backfill    Scan historical blocks for inscriptions/tokens')
     console.log('')
@@ -182,7 +233,10 @@ async function cmdInit () {
   console.log('Next steps:')
   console.log(`  1. Fund your bridge: send BSV to ${config.address}`)
   console.log('  2. Import the funding tx: relay-bridge fund <rawTxHex>')
-  console.log('  3. Run: relay-bridge register')
+  console.log('  3. Register via overlay: relay-bridge register')
+  console.log('')
+  console.log('Optional: set "overlayUrl" in config.json if your overlay')
+  console.log('node is not at the default http://127.0.0.1:3360')
 }
 
 async function cmdSecret () {
@@ -347,7 +401,7 @@ async function cmdRegister () {
   }
 
   const { PersistentStore } = await import('./lib/persistent-store.js')
-  const { runRegister } = await import('./lib/actions.js')
+  const { runOverlayRegister } = await import('./lib/actions.js')
 
   const dataDir = config.dataDir || join(dir, 'data')
   const store = new PersistentStore(dataDir)
@@ -356,13 +410,14 @@ async function cmdRegister () {
   console.log('Registration details:\n')
 
   try {
-    const result = await runRegister({
+    const result = await runOverlayRegister({
       config,
       store,
+      overlayUrl: config.overlayUrl,
       log: (type, msg) => console.log(type === 'done' ? msg : `  ${msg}`)
     })
     console.log('')
-    console.log('Your bridge will appear in peer lists on next scan cycle.')
+    console.log('Your bridge is now registered via SHIP token on the overlay.')
   } catch (err) {
     console.log(`Registration failed: ${err.message}`)
     await store.close()
@@ -542,6 +597,21 @@ async function cmdStart () {
 
   // ── 4a-2. Beacon backfill — scan historical registrations on startup ──
   await backfillBeaconRegistry(registeredPubkeys, config.pubkeyHex)
+
+  // ── 4a-3. Overlay discovery — query overlay for registered bridges ──
+  const overlayPeers = await discoverFromOverlay(registeredPubkeys, config.pubkeyHex, config.meshId, config.overlayUrl)
+  for (const peer of overlayPeers) {
+    if (peer.endpoint) {
+      seedEndpoints.add(peer.endpoint)
+      // Add to seedPeers for outbound dialing (avoid duplicates)
+      const alreadySeeded = seedPeers.some(s =>
+        (typeof s === 'string' ? s : s.endpoint) === peer.endpoint
+      )
+      if (!alreadySeeded) {
+        seedPeers.push({ pubkeyHex: peer.pubkeyHex, endpoint: peer.endpoint })
+      }
+    }
+  }
 
   // ── 4b. Beacon address watcher — detect on-chain registrations ──
   const { extractOpReturnData, decodePayload, PROTOCOL_PREFIX } = await import('@relay-federation/registry/lib/cbor.js')
@@ -1100,6 +1170,40 @@ async function cmdStatus () {
     console.log('  Wallet')
     console.log(`    Balance: ${status.wallet.balanceSats !== null ? status.wallet.balanceSats + ' sats' : '-'}`)
   }
+
+  // Overlay registration
+  console.log('')
+  console.log('  Overlay')
+  const overlayUrl = config.overlayUrl || 'http://127.0.0.1:3360'
+  try {
+    const overlayRes = await fetch(`${overlayUrl}/status`, { signal: AbortSignal.timeout(5000) })
+    if (overlayRes.ok) {
+      const overlayStatus = await overlayRes.json()
+      console.log(`    Directory: ${overlayUrl} (${overlayStatus.topics} topics, ${overlayStatus.entries} entries)`)
+    } else {
+      console.log(`    Directory: ${overlayUrl} (HTTP ${overlayRes.status})`)
+    }
+  } catch {
+    console.log(`    Directory: ${overlayUrl} (unreachable)`)
+  }
+
+  // Check local overlay registration metadata
+  try {
+    const { PersistentStore } = await import('./lib/persistent-store.js')
+    const dataDir = config.dataDir || join(dir, 'data')
+    const store = new PersistentStore(dataDir)
+    await store.open()
+    const shipTxid = await store.getMeta('overlay_ship_txid')
+    const overlayTopic = await store.getMeta('overlay_topic')
+    if (shipTxid) {
+      console.log(`    Registered: ${overlayTopic} (SHIP txid: ${shipTxid.slice(0, 16)}...)`)
+    } else {
+      console.log('    Registered: no (run: relay-bridge register)')
+    }
+    await store.close()
+  } catch {
+    console.log('    Registered: unknown (could not read local state)')
+  }
 }
 
 async function cmdFund () {
@@ -1151,26 +1255,25 @@ async function cmdDeregister () {
   }
 
   const config = await loadConfig(dir)
-  const reason = process.argv[3] || 'shutdown'
 
   const { PersistentStore } = await import('./lib/persistent-store.js')
-  const { runDeregister } = await import('./lib/actions.js')
+  const { runOverlayDeregister } = await import('./lib/actions.js')
 
   const dataDir = config.dataDir || join(dir, 'data')
   const store = new PersistentStore(dataDir)
   await store.open()
 
-  console.log('Deregistration details:\n')
+  console.log('Deregistration:\n')
 
   try {
-    await runDeregister({
+    await runOverlayDeregister({
       config,
       store,
-      reason,
+      overlayUrl: config.overlayUrl,
       log: (type, msg) => console.log(type === 'done' ? msg : `  ${msg}`)
     })
     console.log('')
-    console.log('Your bridge will be removed from peer lists on next scan cycle.')
+    console.log('Your SHIP token has been revoked.')
   } catch (err) {
     console.log(`Deregistration failed: ${err.message}`)
     await store.close()

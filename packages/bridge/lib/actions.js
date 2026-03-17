@@ -194,6 +194,212 @@ export async function runDeregister ({ config, store, reason = 'shutdown', log }
 }
 
 /**
+ * Register this bridge on the relay mesh via overlay (SHIP token).
+ *
+ * Publishes a BRC-48 SHIP token advertising the bridge endpoint and
+ * a mesh-specific topic. Uses BRC-42 derived key from the bridge WIF.
+ *
+ * @param {object} opts
+ * @param {object} opts.config - Bridge config (wif, pubkeyHex, endpoint, meshId)
+ * @param {object} opts.store  - Open PersistentStore instance
+ * @param {string} [opts.overlayUrl] - Overlay node URL for submission (default: http://127.0.0.1:3360)
+ * @param {function} opts.log  - Logger
+ * @returns {object} { txid, topic }
+ */
+export async function runOverlayRegister ({ config, store, overlayUrl = 'http://127.0.0.1:3360', log }) {
+  const { PrivateKey } = await import('@bsv/sdk')
+  const { buildShipTx } = await import('@relay-federation/overlay/ship')
+  const { createAuthSigner } = await import('@relay-federation/overlay/auth')
+
+  const identityKey = PrivateKey.fromWif(config.wif)
+  // For mesh:bridge: tokens, field 3 stores the full WebSocket endpoint
+  // so peers can dial directly without guessing port/protocol
+  const domain = config.endpoint
+  const topic = `mesh:bridge:${config.meshId}`
+
+  log('step', `Pubkey:   ${config.pubkeyHex}`)
+  log('step', `Domain:   ${domain}`)
+  log('step', `Topic:    ${topic}`)
+  log('step', `Overlay:  ${overlayUrl}`)
+
+  // Get UTXOs from local store
+  const localUtxos = await store.getUnspentUtxos()
+  if (!localUtxos.length) {
+    throw new Error('No UTXOs found. Fund your bridge first: relay-bridge fund <rawTxHex>')
+  }
+
+  const utxos = []
+  for (const u of localUtxos) {
+    const rawHex = await store.getTx(u.txid)
+    if (!rawHex) continue
+    utxos.push({ txHex: rawHex, outputIndex: u.vout, satoshis: u.satoshis })
+  }
+
+  if (!utxos.length) {
+    throw new Error('No usable UTXOs (missing source transactions).')
+  }
+
+  // Build SHIP token tx
+  log('step', 'Building SHIP registration token...')
+  const result = await buildShipTx({ identityKey, domain, topic, utxos })
+  log('step', `SHIP tx: ${result.txid}`)
+
+  // Broadcast via BSV P2P
+  const { BSVNodeClient } = await import('./bsv-node-client.js')
+  log('step', 'Connecting to BSV network...')
+  const bsvNode = new BSVNodeClient()
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { bsvNode.disconnect(); reject(new Error('BSV node connection timeout (15s)')) }, 15000)
+    bsvNode.on('handshake', () => { clearTimeout(timeout); resolve() })
+    bsvNode.on('error', (err) => { clearTimeout(timeout); reject(err) })
+    bsvNode.connect()
+  })
+
+  try {
+    bsvNode.broadcastTx(result.txHex)
+    log('step', 'Broadcast: success')
+
+    await new Promise(r => setTimeout(r, 1000))
+
+    // Submit to overlay node — registration fails if overlay doesn't accept
+    const signer = createAuthSigner(identityKey)
+    const bodyStr = JSON.stringify({ rawTx: result.txHex, outputIndex: result.shipOutputIndex })
+    const submitRes = await fetch(`${overlayUrl}/submit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-overlay-auth': signer.sign('POST', '/submit', bodyStr)
+      },
+      body: bodyStr,
+      signal: AbortSignal.timeout(10000)
+    })
+    const submitData = await submitRes.json()
+
+    if (submitData.status !== 'success' || !submitData.topics || Object.keys(submitData.topics).length === 0) {
+      throw new Error(`Overlay rejected registration: ${submitData.code || submitData.description || 'no topics admitted'}`)
+    }
+
+    log('step', `Overlay: admitted (${topic})`)
+
+    // Store metadata for deregistration — only after confirmed admission
+    await store.putMeta('overlay_ship_txid', result.txid)
+    await store.putMeta('overlay_ship_vout', result.shipOutputIndex)
+    await store.putMeta('overlay_ship_txhex', result.txHex)
+    await store.putMeta('overlay_topic', topic)
+
+    log('done', `Registration complete! SHIP txid: ${result.txid}`, { txid: result.txid, topic })
+    return { txid: result.txid, topic }
+  } finally {
+    bsvNode.disconnect()
+  }
+}
+
+/**
+ * Deregister this bridge from the overlay by spending the SHIP token.
+ *
+ * @param {object} opts
+ * @param {object} opts.config - Bridge config (wif, pubkeyHex)
+ * @param {object} opts.store  - Open PersistentStore instance
+ * @param {string} [opts.overlayUrl] - Overlay node URL
+ * @param {function} opts.log  - Logger
+ * @returns {object} { txid }
+ */
+export async function runOverlayDeregister ({ config, store, overlayUrl = 'http://127.0.0.1:3360', log }) {
+  const { PrivateKey, Transaction, P2PKH } = await import('@bsv/sdk')
+  const { deriveChild, INVOICES } = await import('@relay-federation/common/derivation')
+  const { createAuthSigner } = await import('@relay-federation/overlay/auth')
+
+  const shipTxid = await store.getMeta('overlay_ship_txid')
+  const shipVout = await store.getMeta('overlay_ship_vout')
+  const shipTxHex = await store.getMeta('overlay_ship_txhex')
+
+  if (!shipTxid || !shipTxHex) {
+    throw new Error('No overlay registration found. Run: relay-bridge register')
+  }
+
+  log('step', `Revoking SHIP token: ${shipTxid}:${shipVout}`)
+
+  const identityKey = PrivateKey.fromWif(config.wif)
+  const { childKey } = deriveChild(identityKey, INVOICES.SHIP)
+  const p2pkh = new P2PKH()
+  const changeAddress = identityKey.toPublicKey().toAddress()
+
+  // Build spend tx consuming the SHIP token
+  const sourceTransaction = Transaction.fromHex(shipTxHex)
+  const tx = new Transaction()
+  tx.addInput({
+    sourceTXID: shipTxid,
+    sourceOutputIndex: shipVout,
+    sourceTransaction,
+    unlockingScriptTemplate: {
+      sign: async (tx, inputIndex) => {
+        return tx.sign(childKey, 'all', inputIndex, sourceTransaction.outputs[shipVout].lockingScript, 1)
+      },
+      estimateLength: () => 73
+    }
+  })
+  tx.addOutput({ lockingScript: p2pkh.lock(changeAddress), change: true })
+
+  const { SatoshisPerKilobyte } = await import('@bsv/sdk')
+  await tx.fee(new SatoshisPerKilobyte(1000))
+  await tx.sign()
+
+  const spendTxHex = tx.toHex()
+  const spendTxid = tx.id('hex')
+
+  // Broadcast
+  const { BSVNodeClient } = await import('./bsv-node-client.js')
+  log('step', 'Connecting to BSV network...')
+  const bsvNode = new BSVNodeClient()
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { bsvNode.disconnect(); reject(new Error('BSV node connection timeout (15s)')) }, 15000)
+    bsvNode.on('handshake', () => { clearTimeout(timeout); resolve() })
+    bsvNode.on('error', (err) => { clearTimeout(timeout); reject(err) })
+    bsvNode.connect()
+  })
+
+  try {
+    bsvNode.broadcastTx(spendTxHex)
+    log('step', `Spend broadcast: ${spendTxid}`)
+
+    await new Promise(r => setTimeout(r, 1000))
+
+    // Notify overlay — deregistration fails if overlay doesn't confirm revocation
+    const signer = createAuthSigner(identityKey)
+    const bodyStr = JSON.stringify({ spendingTxHex: spendTxHex, spentTxid: shipTxid, spentOutputIndex: shipVout })
+    const revokeRes = await fetch(`${overlayUrl}/revoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-overlay-auth': signer.sign('POST', '/revoke', bodyStr)
+      },
+      body: bodyStr,
+      signal: AbortSignal.timeout(10000)
+    })
+    const revokeData = await revokeRes.json()
+
+    if (!revokeData.revoked) {
+      throw new Error(`Overlay did not confirm revocation: ${revokeData.reason || 'unknown'}`)
+    }
+
+    log('step', 'Overlay: revoked')
+
+    // Clear stored metadata — only after confirmed revocation
+    await store.putMeta('overlay_ship_txid', null)
+    await store.putMeta('overlay_ship_vout', null)
+    await store.putMeta('overlay_ship_txhex', null)
+    await store.putMeta('overlay_topic', null)
+
+    log('done', `Deregistration complete! Spend txid: ${spendTxid}`, { txid: spendTxid })
+    return { txid: spendTxid }
+  } finally {
+    bsvNode.disconnect()
+  }
+}
+
+/**
  * Fund this bridge by storing a raw transaction's outputs.
  * No BSV P2P needed — just parses the tx and stores matching UTXOs.
  *

@@ -437,4 +437,65 @@ describe('StatusServer data endpoints', () => {
     })
     assert.equal(res.status, 503)
   })
+
+  // ── Operator endpoint tests (overlay registration) ──
+
+  it('POST /register returns 401 without auth', async () => {
+    const port = portCounter++
+    const config = { ...TEST_CONFIG, statusSecret: 'testsecret123' }
+    server = new StatusServer({ port, config })
+    await server.start()
+
+    const res = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    assert.equal(res.status, 401)
+  })
+
+  it('POST /register returns 202 with valid auth', { timeout: 10000 }, async () => {
+    const port = portCounter++
+    const config = { ...TEST_CONFIG, statusSecret: 'testsecret123', wif: PrivateKey.fromRandom().toWif() }
+    server = new StatusServer({ port, config })
+    server._store = { getUnspentUtxos: async () => [], getMeta: async () => null, putMeta: async () => {} }
+    await server.start()
+
+    const res = await fetch(`http://127.0.0.1:${port}/register?auth=testsecret123`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    assert.equal(res.status, 202)
+    const body = await res.json()
+    assert.ok(body.jobId, 'Should return a job ID')
+    assert.ok(body.stream, 'Should return a stream URL')
+  })
+
+  it('POST /deregister returns 401 without auth', async () => {
+    const port = portCounter++
+    const config = { ...TEST_CONFIG, statusSecret: 'testsecret123' }
+    server = new StatusServer({ port, config })
+    await server.start()
+
+    const res = await fetch(`http://127.0.0.1:${port}/deregister`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    assert.equal(res.status, 401)
+  })
+
+  it('POST /deregister returns 202 with valid auth', { timeout: 10000 }, async () => {
+    const port = portCounter++
+    const config = { ...TEST_CONFIG, statusSecret: 'testsecret123', wif: PrivateKey.fromRandom().toWif() }
+    server = new StatusServer({ port, config })
+    server._store = { getUnspentUtxos: async () => [], getMeta: async () => null, putMeta: async () => {} }
+    await server.start()
+
+    const res = await fetch(`http://127.0.0.1:${port}/deregister?auth=testsecret123`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    assert.equal(res.status, 202)
+    const body = await res.json()
+    assert.ok(body.jobId)
+  })
 })

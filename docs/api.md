@@ -601,7 +601,7 @@ All operator endpoints require authentication via `statusSecret`.
 
 ### POST /register
 
-Start on-chain bridge registration. Builds stake bond + registration tx, broadcasts via BSV P2P. Returns immediately with a job ID for progress tracking.
+Register this bridge via overlay SHIP token. Publishes a BRC-48 SHIP token containing the bridge endpoint and mesh ID, broadcasts to BSV network, and submits to the overlay directory. Returns immediately with a job ID for progress tracking.
 
 **Response (202):**
 
@@ -615,7 +615,7 @@ Track progress via `GET /jobs/:id` (SSE stream).
 
 ### POST /deregister
 
-Start on-chain bridge deregistration.
+Deregister this bridge by revoking its SHIP token. Spends the SHIP token UTXO and notifies the overlay directory.
 
 **Request body:**
 
@@ -694,11 +694,13 @@ SSE stream for tracking async job progress (register, deregister, send).
 **Response:** `text/event-stream`
 
 ```
-data: {"type":"step","message":"Building stake bond...","timestamp":1741700000000}
+data: {"type":"step","message":"Building SHIP registration token...","timestamp":1741700000000}
 
-data: {"type":"step","message":"Stake bond txid: abc123...","timestamp":1741700001000}
+data: {"type":"step","message":"SHIP tx: abc123...","timestamp":1741700001000}
 
-data: {"type":"done","message":"Registration broadcast successful!","data":{"stakeTxid":"abc...","registrationTxid":"def..."},"timestamp":1741700002000}
+data: {"type":"step","message":"Overlay: admitted (mesh:bridge:70016)","timestamp":1741700002000}
+
+data: {"type":"done","message":"Registration complete! SHIP txid: abc123...","data":{"txid":"abc...","topic":"mesh:bridge:70016"},"timestamp":1741700003000}
 
 data: {"type":"end","status":"completed"}
 ```

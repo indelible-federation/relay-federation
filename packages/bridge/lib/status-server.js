@@ -595,37 +595,35 @@ export class StatusServer {
       return
     }
 
-    // POST /register — operator: start async registration
+    // POST /register — operator: start async overlay registration (SHIP token)
     if (req.method === 'POST' && path === '/register') {
       if (!authenticated) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized. Provide statusSecret via ?auth= or Authorization header.' }))
         return
       }
-      const { runRegister } = await import('./actions.js')
+      const { runOverlayRegister } = await import('./actions.js')
       const { jobId, log } = this._createJob()
       res.writeHead(202, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ jobId, stream: `/jobs/${jobId}` }))
-      // Run async — don't await
-      runRegister({ config: this._config, store: this._store, log }).catch(err => {
+      runOverlayRegister({ config: this._config, store: this._store, overlayUrl: this._config.overlayUrl, log }).catch(err => {
         log('error', err.message)
       })
       return
     }
 
-    // POST /deregister — operator: start async deregistration
+    // POST /deregister — operator: start async overlay deregistration (revoke SHIP token)
     if (req.method === 'POST' && path === '/deregister') {
       if (!authenticated) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized. Provide statusSecret via ?auth= or Authorization header.' }))
         return
       }
-      const { runDeregister } = await import('./actions.js')
-      const body = await this._readBody(req)
+      const { runOverlayDeregister } = await import('./actions.js')
       const { jobId, log } = this._createJob()
       res.writeHead(202, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ jobId, stream: `/jobs/${jobId}` }))
-      runDeregister({ config: this._config, store: this._store, reason: body.reason || 'shutdown', log }).catch(err => {
+      runOverlayDeregister({ config: this._config, store: this._store, overlayUrl: this._config.overlayUrl, log }).catch(err => {
         log('error', err.message)
       })
       return

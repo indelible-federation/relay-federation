@@ -1,6 +1,6 @@
 # Relay Federation
 
-A federated mesh network for BSV. Each bridge is a lightweight SPV node that syncs headers, verifies transactions with Merkle proofs, indexes inscriptions and tokens, and serves a full REST API — no full node required. Bridges discover each other on-chain, peer over WebSocket, and share data across the mesh. Run your own infrastructure in three commands.
+A federated mesh network for BSV. Each bridge is a lightweight SPV node that syncs headers, verifies transactions with Merkle proofs, indexes inscriptions and tokens, and serves a full REST API — no full node required. Bridges register via SHIP tokens on the overlay directory, peer over WebSocket, and share data across the mesh. Run your own infrastructure in three commands.
 
 ## Features
 
@@ -11,9 +11,9 @@ A federated mesh network for BSV. Each bridge is a lightweight SPV node that syn
 - **Protocol parsing** — P2PKH, OP_RETURN, ordinals, B://, BCAT, MAP, MetaNet, BSV-20
 - **Data envelope relay** — broadcast signed, TTL-bounded, topic-routed ephemeral data (rates, attestations, notifications) across the mesh without on-chain transactions
 - **Price feed** — live BSV/USD from WhatsOnChain
-- **Federation mesh** — bridges discover and verify each other via on-chain stake bonds
+- **Federation mesh** — bridges discover and verify each other via SHIP token overlay directory and beacon backfill
+- **Overlay registration** — BRC-42 derived SHIP tokens for bridge identity and discovery
 - **Operator dashboard** — glassmorphism UI with Overview, Mempool, Explorer, Inscriptions, Tokens, and Apps tabs, plus a 3D mesh topology map powered by Three.js
-- **422 tests passing** (330 bridge + 92 common/registry/sdk) — MIT license
 
 ## Packages
 
@@ -64,7 +64,7 @@ relay-bridge init
 #    Then import the funding tx (get raw hex from your wallet or block explorer)
 relay-bridge fund <rawTxHex>
 
-# 4. Register on-chain — creates stake bond + publishes registration tx
+# 4. Register on the overlay directory (publishes SHIP token)
 relay-bridge register
 
 # 5. Start the bridge
@@ -80,8 +80,8 @@ relay-bridge start
 | `relay-bridge start ws://host:port` | Start and connect to a specific peer |
 | `relay-bridge status` | Show running bridge status — peers, headers, mempool |
 | `relay-bridge fund <rawTxHex>` | Import a funding transaction (raw hex) into the bridge's UTXO store |
-| `relay-bridge register` | Register on-chain — builds stake bond tx + registration tx, broadcasts to BSV network |
-| `relay-bridge deregister [reason]` | Deregister this bridge from the mesh |
+| `relay-bridge register` | Register via overlay — publishes SHIP token to the directory |
+| `relay-bridge deregister` | Deregister — revokes SHIP token from the overlay |
 | `relay-bridge backfill` | Backfill historical inscriptions and tokens for watched addresses |
 | `relay-bridge secret` | Show your operator secret for dashboard login |
 
@@ -116,10 +116,7 @@ relay-bridge start
 
 ## Registration
 
-Registration puts your bridge on-chain so other bridges can discover and peer with it. It's a two-transaction process:
-
-1. **Stake bond tx** — locks 1,000,000 sats (minimum) to your own address as proof of BSV ownership. Operators can stake more for a slightly higher trust score.
-2. **Registration tx** — OP_RETURN with CBOR-encoded payload: endpoint, pubkey, capabilities, mesh ID, stake txid. Sends 100 sats dust to the beacon address for discoverability.
+Registration publishes a SHIP token to the overlay directory so other bridges can discover and peer with you. The SHIP token contains your bridge identity, WebSocket endpoint, and mesh ID.
 
 ```bash
 # 1. Send BSV to your bridge address (shown during init)
@@ -130,8 +127,8 @@ relay-bridge fund <rawTxHex>
 # 4. Register (bridge must be stopped — can't share LevelDB lock)
 relay-bridge register
 # Output:
-#   Stake bond txid: abc123...
-#   Registration broadcast successful! txid: def456...
+#   SHIP tx: abc123...
+#   Overlay: admitted (mesh:bridge:70016)
 
 # 5. Start the bridge
 relay-bridge start
@@ -139,22 +136,25 @@ relay-bridge start
 
 **Important:** The bridge must be stopped when running `register` — both commands need exclusive access to the LevelDB store. Fund first, then register, then start.
 
-### Beacon Backfill
+The bridge uses BRC-42 key derivation from your configured WIF to sign the SHIP token. Your identity key remains the same — a derived child key (invoice `2-SHIP-1`) locks the token.
 
-On startup, each bridge scans the beacon address history to discover peers that registered before this bridge came online. This ensures bridges that restart (or join later) immediately know about all registered peers — no manual seed list needed.
+### Peer Discovery
 
-The backfill queries WhatsOnChain's `/confirmed/history` endpoint for the beacon address, then replays each registration/deregistration transaction to build the trusted pubkey whitelist.
+On startup, each bridge discovers peers from multiple sources:
 
-### Stake Bond
+1. **Configured seed peers** — from `seedPeers` in config.json
+2. **Beacon backfill** — scans the legacy beacon address history via WhatsOnChain
+3. **Overlay discovery** — queries the overlay directory for `mesh:bridge:<meshId>` entries
 
-| Parameter | Value |
-|-----------|-------|
-| Minimum | 1,000,000 sats (~0.01 BSV) |
-| Purpose | Proof of BSV ownership, Sybil deterrence |
-| Scoring weight | 10% (stake_age factor in peer scoring) |
-| Recovery | Deregister to unlock |
+All sources feed the same trusted pubkey set used for handshake gating. Overlay-discovered peers are also dialed automatically.
 
-The stake isn't a payment — it's a security deposit locked to your own address. Higher stakes don't buy much in scoring (only 10% weight). The real defense against bad actors is data_accuracy scoring (40% weight) — fake bridges get auto-disconnected.
+For migration details, see [docs/overlay-migration.md](docs/overlay-migration.md).
+
+### Stake Bond (legacy)
+
+> **Note:** Overlay registration via SHIP tokens does not require a stake bond. The stake bond was part of the legacy beacon registration flow. Bridges registered via overlay are discovered through the directory and trusted via BRC-42 identity verification.
+
+The stake bond remains a peer scoring factor (10% weight) for bridges that previously registered via beacon. The real defense against bad actors is data_accuracy scoring (40% weight) — fake bridges get auto-disconnected.
 
 ### Peer Scoring
 

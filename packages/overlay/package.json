@@ -1,0 +1,34 @@
+{
+  "name": "@relay-federation/overlay",
+  "version": "0.1.0",
+  "description": "SHIP/SLAP overlay for relay mesh topic and bridge discovery",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./ship": "./lib/ship.js",
+    "./slap": "./lib/slap.js",
+    "./lookup": "./lib/lookup.js",
+    "./store": "./lib/store.js",
+    "./auth": "./lib/auth.js",
+    "./sync": "./lib/sync.js",
+    "./client": "./lib/client.js",
+    "./server": "./lib/server.js"
+  },
+  "scripts": {
+    "test": "OVERLAY_SKIP_CHAIN_CHECK=true node --test test/*.test.js",
+    "test:hardened": "node --test test/auth.test.js test/ship.test.js test/slap.test.js test/derivation.test.js"
+  },
+  "dependencies": {
+    "@relay-federation/common": "^0.2.0",
+    "level": "^9.0.0"
+  },
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "author": "BSVAnon",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zcoolz/relay-federation",
+    "directory": "packages/overlay"
+  },
+  "engines": { "node": ">=20" }
+}
