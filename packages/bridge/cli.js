@@ -1116,12 +1116,6 @@ async function cmdStart () {
     statusServer.addLog(msg)
   })
 
-  sessionRelay.on('sessions:sync', ({ pubkeyHex, address, added, total }) => {
-    const msg = `Synced ${added} sessions for ${address.slice(0, 12)}... from ${pubkeyHex.slice(0, 16)}... (total: ${total})`
-    console.log(msg)
-    statusServer.addLog(msg)
-  })
-
   txRelay.on('tx:new', ({ txid, rawHex }) => {
     const msg = `New tx: ${txid}`
     console.log(msg)
