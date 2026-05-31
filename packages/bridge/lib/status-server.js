@@ -529,7 +529,11 @@ export class StatusServer {
         })
       })
 
-      this._server.listen(this._port, '0.0.0.0', () => {
+      // Personal mode (g-192): config.statusBindAddress can restrict the status
+      // server to localhost (127.0.0.1) so a personal/home bridge doesn't expose
+      // its dashboard to the network. Defaults to 0.0.0.0 (federation default).
+      const bindAddr = this._config.statusBindAddress || '0.0.0.0'
+      this._server.listen(this._port, bindAddr, () => {
         this.startTxCleanup()
         resolve()
       })

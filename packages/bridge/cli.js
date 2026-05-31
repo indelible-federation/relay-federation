@@ -7,6 +7,7 @@ import { HeaderRelay } from './lib/header-relay.js'
 import { TxRelay } from './lib/tx-relay.js'
 import { DataRelay } from './lib/data-relay.js'
 import { StatusServer } from './lib/status-server.js'
+import { parseFlags, applyModeDefaults, warnOnModeMismatch } from './lib/personal-mode.js'
 // network.js import removed — register/deregister now use local UTXOs + P2P broadcast
 
 const command = process.argv[2]
@@ -458,9 +459,21 @@ async function cmdStart () {
     process.exit(1)
   }
 
-  const config = await loadConfig(dir)
+  const rawConfig = await loadConfig(dir)
   const rawPeerArg = process.argv[3] // optional: ws://host:port
   const peerArg = (rawPeerArg && !rawPeerArg.startsWith('-')) ? rawPeerArg : null
+
+  // ── Personal mode (g-192) ─────────────────────────────────
+  // --personal flag (or config.personal: true) runs an outbound-only bridge:
+  // gossip listener disabled + status server bound to localhost. Defaults live
+  // in lib/personal-mode.js so PeerManager + StatusServer stay dumb executors.
+  const flags = parseFlags(process.argv.slice(3))
+  const isPersonal = flags.personal || rawConfig.personal === true
+  warnOnModeMismatch(rawConfig)
+  const config = applyModeDefaults(rawConfig, isPersonal)
+  if (isPersonal) {
+    console.log('[PERSONAL] Personal Bridge mode — gossip listener disabled, status bound to localhost')
+  }
 
   // ── 1. Open persistent store ──────────────────────────────
   const { PersistentStore } = await import('./lib/persistent-store.js')
@@ -745,7 +758,13 @@ async function cmdStart () {
   }
 
   // ── 5. Start server ───────────────────────────────────────
-  await peerManager.startServer({ port: config.port, host: '0.0.0.0', pubkeyHex: config.pubkeyHex, endpoint: config.endpoint, handshake, registeredPubkeys, seedEndpoints })
+  // g-192: host defaults to 0.0.0.0 but config.host can override (e.g. '::' for
+  // dual-stack). startGossipListener===false (personal mode) skips the inbound
+  // WebSocket server entirely (peer-manager honors it as authoritative).
+  await peerManager.startServer({ port: config.port, host: config.host ?? '0.0.0.0', pubkeyHex: config.pubkeyHex, endpoint: config.endpoint, handshake, registeredPubkeys, seedEndpoints, startGossipListener: config.startGossipListener })
+  if (config.startGossipListener === false) {
+    console.log('  Personal mode: gossip listener disabled (outbound-only)')
+  }
   console.log(`Bridge listening on port ${config.port}`)
   console.log(`  Pubkey: ${config.pubkeyHex}`)
   console.log(`  Mesh:   ${config.meshId}`)

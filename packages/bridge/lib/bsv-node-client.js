@@ -1,8 +1,64 @@
 import { EventEmitter } from 'node:events'
 import { createServer } from 'node:net'
-import { resolve4 } from 'node:dns/promises'
+import { resolve4, resolve6 } from 'node:dns/promises'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { BSVPeer } from './bsv-peer.js'
+
+// g-261 IPv6 P2P support — addrPool key helpers.
+// _goodPeers is keyed by bare host (Map<host,info>); _addrPool is keyed by
+// "host:port" string. IPv6 addresses contain colons, so the "host:port" form
+// is ambiguous for v6 — use bracketed format [v6]:port for v6, bare for v4.
+// normalizeHost strips any incidental brackets from stored entries so that
+// old unbracketed entries and new bracketed entries don't double-up after
+// load+save cycle (Pack #1 attack #1).
+//
+// Pack #2 V3 hardening: non-string hosts (could happen if good-peers.json is
+// hand-edited with a non-string value, or a future code path passes a number)
+// must not crash keyFor's .includes() call. Return null and let callers skip.
+function normalizeHost (host) {
+  if (typeof host !== 'string') return null
+  return host.replace(/^\[|\]$/g, '')
+}
+function keyFor (host, port) {
+  const h = normalizeHost(host)
+  if (h === null) return null
+  return h.includes(':') ? `[${h}]:${port}` : `${h}:${port}`
+}
+
+// g-261 IPv6 P2P — log a warning at startup if the host kernel has
+// `net.ipv6.bindv6only=1`. In that mode, a socket bound to `::` does NOT
+// accept IPv4 connections, so our dual-stack listener would silently drop
+// all inbound IPv4. Vultr Ubuntu defaults to 0 (dual-stack enabled), but
+// hardened images or admins flipping the sysctl could break us. We warn
+// rather than auto-fix because operator intent matters here.
+//
+// Pack #3 V4: module-level dedup flag — fires at most once per process so a
+// bridge that calls startListening multiple times (or has multiple listeners)
+// doesn't spam logs. The warn message includes both current-boot and
+// persistent fixes so operators don't have to look up sysctl syntax.
+let _bindV6WarnEmitted = false
+function warnIfBindV6OnlyEnabled () {
+  if (_bindV6WarnEmitted) return
+  if (process.platform !== 'linux') return
+  try {
+    const val = readFileSync('/proc/sys/net/ipv6/bindv6only', 'utf8').trim()
+    if (val === '1') {
+      _bindV6WarnEmitted = true
+      console.warn(
+        '[P2P] WARN: sysctl net.ipv6.bindv6only=1 — `::` listener will NOT accept IPv4.\n' +
+        '  Fix for current boot:  sysctl -w net.ipv6.bindv6only=0\n' +
+        '  Fix permanently:       echo "net.ipv6.bindv6only=0" >> /etc/sysctl.conf && sysctl -p'
+      )
+    }
+  } catch {
+    // /proc not available (sandboxed/container) — silent
+  }
+}
+
+// Shared across both relay paths (inbound + outbound) — rate-limits total
+// [P2P relay] log output to ~1/100 of relay events. JS event loop is single-
+// threaded so the shared counter is safe; reads/writes are atomic within a tick.
+let _relayLogCounter = 0
 
 /**
  * BSVNodeClient — multi-peer pool manager for BSV P2P connections.
@@ -14,7 +70,8 @@ import { BSVPeer } from './bsv-peer.js'
  * - Fetches transactions from first available peer
  * - Maintains peer pool with periodic health checks
  *
- * Adapted for the open protocol (no third-party APIs).
+ * Ported from production Indelible SPV bridge (spv-client.js)
+ * peer management, adapted for the open protocol (no third-party APIs).
  *
  * Events (proxied from all peers):
  *   'headers'      — { headers, count }
@@ -80,11 +137,31 @@ export class BSVNodeClient extends EventEmitter {
     this._peerCooldown = new Map()
     this._baseCooldownMs = 30000       // 30s initial cooldown
     this._maxCooldownMs = 1800000      // 30 min cap (prevents refreshing 24hr bans on BSV nodes)
-    // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect
-    this._blacklist = new Set()
 
-    // Peers discovered via P2P addr exchange (not just DNS)
-    this._addrPool = new Set()
+    // g-205: size-capped LRU Maps replace unbounded Sets to prevent V8 heap leak
+    // under sustained peer-discovery load (e.g. bridge-7 hosting bsv-seed).
+    // Eviction is LRU-on-write only — see _addrPoolAdd / _blacklistAdd / _blacklistHas.
+    // Pack-reviewed across 3 rounds (txids 97a45976..., b1ee42fd..., 392879ad...).
+
+    // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect.
+    // Map: host → bannedAt ms.
+    this._blacklist = new Map()
+    this._blacklistMax = opts.maxBlacklist != null ? opts.maxBlacklist : 10000
+    this._blacklistEvictions = 0
+
+    // Peers discovered via P2P addr exchange (not just DNS).
+    // Map: "host:port" → lastSeen ms.
+    this._addrPool = new Map()
+    this._addrPoolMax = opts.maxAddrPool != null ? opts.maxAddrPool : 50000
+    this._addrPoolEvictions = 0
+
+    // Validate caps — max < 1 is almost certainly a misconfiguration.
+    if (this._addrPoolMax < 1) {
+      console.warn(`[bsv-node-client] WARNING: maxAddrPool=${this._addrPoolMax} — every addr will be immediately evicted. Intended?`)
+    }
+    if (this._blacklistMax < 1) {
+      console.warn(`[bsv-node-client] WARNING: maxBlacklist=${this._blacklistMax} — every blacklist entry will be immediately evicted. Intended?`)
+    }
 
     // Transaction relay — dedup set to prevent relay loops
     this._seenTxids = new Set()
@@ -121,6 +198,45 @@ export class BSVNodeClient extends EventEmitter {
       this._sharedHeaderHashes.set(this._checkpoint.height - 1, this._checkpoint.prevHash)
       this._sharedHashToHeight.set(this._checkpoint.prevHash, this._checkpoint.height - 1)
     }
+  }
+
+  // ─── g-205 size-capped LRU helpers ──────────────────────────────────────
+  // Mirrors tx-relay.js Map-as-LRU pattern. Both Maps use insertion-order as
+  // recency. delete-then-set on add promotes existing key to the tail
+  // (most-recent). Eviction removes the head (oldest). Eviction is write-only
+  // for both. _blacklistHas() is a pure read so blacklist eviction tracks ban
+  // time, not check frequency — fixes the policy-inversion bug that pack R2
+  // caught in V2.
+
+  _addrPoolAdd (key) {
+    if (this._addrPool.has(key)) this._addrPool.delete(key)  // LRU-helper-internal
+    this._addrPool.set(key, Date.now())  // LRU-helper-internal
+    if (this._addrPool.size > this._addrPoolMax) {
+      const oldest = this._addrPool.keys().next().value
+      if (oldest !== undefined) {
+        this._addrPool.delete(oldest)  // LRU-helper-internal: eviction
+        this._addrPoolEvictions++
+      }
+    }
+  }
+
+  _blacklistAdd (host) {
+    if (this._blacklist.has(host)) this._blacklist.delete(host)  // LRU-helper-internal
+    this._blacklist.set(host, Date.now())  // LRU-helper-internal
+    if (this._blacklist.size > this._blacklistMax) {
+      const oldest = this._blacklist.keys().next().value
+      if (oldest !== undefined) {
+        this._blacklist.delete(oldest)  // LRU-helper-internal: eviction
+        this._blacklistEvictions++
+      }
+    }
+  }
+
+  // Pure read. Migrated callers go through this so:
+  // (1) grep enforces zero raw `_blacklist.has()` outside helpers in this file
+  // (2) future TTL / metrics hooks have one insertion point
+  _blacklistHas (host) {
+    return this._blacklist.has(host)  // LRU-helper-internal
   }
 
   /**
@@ -221,12 +337,16 @@ export class BSVNodeClient extends EventEmitter {
     const listenPort = port || this._listenPort
     this._server = createServer((socket) => {
       const host = socket.remoteAddress?.replace('::ffff:', '') || 'unknown'
-      if (this._blacklist.has(host) || this._peers.has(host)) {
+      if (this._blacklistHas(host) || this._peers.has(host)) {
         socket.destroy()
         return
       }
-      // Cap total peers (inbound + outbound)
-      if (this._peers.size >= 32) {
+      // Cap total peers (inbound + outbound). Lowered 32→12 for memory budget.
+      // Note: this is the SECONDARY lever. The primary pressure relief comes
+      // from the outbound `maxPeers` config (8). Peers we reject here will
+      // retry; if we see persistent inbound churn at this boundary, raise this
+      // ceiling rather than chase it with backoff logic.
+      if (this._peers.size >= 12) {
         socket.destroy()
         return
       }
@@ -242,8 +362,15 @@ export class BSVNodeClient extends EventEmitter {
       }
     })
 
-    this._server.listen(listenPort, '0.0.0.0', () => {
-      console.log(`[P2P] Listening for inbound connections on port ${listenPort}`)
+    // g-261 IPv6 P2P: bind dual-stack on '::' so we accept both IPv4
+    // (via IPv4-mapped IPv6) AND native IPv6 inbound. Linux default
+    // IPV6_V6ONLY=0 means a v6 socket accepts both families. Same kernel
+    // assumption as g-261 step 1 cli.js change already shipped + verified
+    // on the same fleet. All federation VPSs run Vultr Linux.
+    // Pack #2 V3: warn if sysctl breaks the dual-stack assumption.
+    warnIfBindV6OnlyEnabled()
+    this._server.listen(listenPort, '::', () => {
+      console.log(`[P2P] Listening for inbound connections on port ${listenPort} (dual-stack)`)
     })
   }
 
@@ -292,8 +419,8 @@ export class BSVNodeClient extends EventEmitter {
 
     peer.on('addr', ({ addrs }) => {
       for (const a of addrs) {
-        if (!this._peers.has(a.host) && !this._blacklist.has(a.host)) {
-          this._addrPool.add(`${a.host}:${a.port}`)
+        if (!this._peers.has(a.host) && !this._blacklistHas(a.host)) {
+          this._addrPoolAdd(keyFor(a.host, a.port))
           this._connectToPeer(a.host, a.port)
         }
       }
@@ -303,7 +430,7 @@ export class BSVNodeClient extends EventEmitter {
       const wasBch = !peer._handshakeComplete && peer._peerUserAgent && !peer._peerUserAgent.includes('Bitcoin SV')
       this._peers.delete(host)
       if (wasBch) {
-        this._blacklist.add(host)
+        this._blacklistAdd(host)
       }
       this.emit('disconnected', data)
     })
@@ -334,7 +461,10 @@ export class BSVNodeClient extends EventEmitter {
           }
         }
         if (relayCount > 0) {
-          console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate)`)
+          _relayLogCounter++
+          if (_relayLogCounter % 100 === 0) {
+            console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate) [sampled 1/100, total=${_relayLogCounter}]`)
+          }
         }
         peer.requestTxs(newTxids)
       }
@@ -547,17 +677,31 @@ export class BSVNodeClient extends EventEmitter {
     const seen = new Set()
     const peers = []
 
+    // g-261 IPv6 P2P: resolve both A (IPv4) and AAAA (IPv6) per seed in parallel.
+    // Per-failure logging distinguishes real DNS errors from "no AAAA records" —
+    // ENODATA/ENOTFOUND on AAAA is normal for seeds that don't have IPv6 yet, so
+    // suppress those; warn on any other failure so operator has a signal.
     for (const seed of this._seeds) {
-      try {
-        const addrs = await resolve4(seed)
-        for (const addr of addrs) {
+      const [r4, r6] = await Promise.allSettled([resolve4(seed), resolve6(seed)])
+      if (r4.status === 'fulfilled') {
+        for (const addr of r4.value) {
           if (!seen.has(addr)) {
             seen.add(addr)
             peers.push({ host: addr, port: this._port })
           }
         }
-      } catch {
-        // DNS resolution failed for this seed — try others
+      } else if (r4.reason?.code !== 'ENODATA' && r4.reason?.code !== 'ENOTFOUND') {
+        console.warn(`[P2P] DNS seed resolve4(${seed}) failed: ${r4.reason?.message || r4.reason}`)
+      }
+      if (r6.status === 'fulfilled') {
+        for (const addr of r6.value) {
+          if (!seen.has(addr)) {
+            seen.add(addr)
+            peers.push({ host: addr, port: this._port })
+          }
+        }
+      } else if (r6.reason?.code !== 'ENODATA' && r6.reason?.code !== 'ENOTFOUND') {
+        console.warn(`[P2P] DNS seed resolve6(${seed}) failed: ${r6.reason?.message || r6.reason}`)
       }
     }
 
@@ -639,10 +783,11 @@ export class BSVNodeClient extends EventEmitter {
    */
   async _connectToPeer (host, port) {
     if (this._peers.has(host) || this._destroyed) return
-    if (this._blacklist.has(host)) return
+    if (this._blacklistHas(host)) return
     if (this._isInCooldown(host)) return
-    // Cap total peers to prevent unbounded growth
-    if (this._peers.size >= 32) return
+    // Cap total peers to prevent unbounded growth. Lowered 32→12 for memory
+    // budget; primary pressure relief is the outbound `maxPeers` config (8).
+    if (this._peers.size >= 12) return
 
     const peer = new BSVPeer({
       checkpoint: this._checkpoint,
@@ -690,8 +835,8 @@ export class BSVNodeClient extends EventEmitter {
     // Discover new peers through P2P addr exchange
     peer.on('addr', ({ addrs }) => {
       for (const a of addrs) {
-        if (!this._peers.has(a.host) && !this._blacklist.has(a.host)) {
-          this._addrPool.add(`${a.host}:${a.port}`)
+        if (!this._peers.has(a.host) && !this._blacklistHas(a.host)) {
+          this._addrPoolAdd(keyFor(a.host, a.port))
           this._connectToPeer(a.host, a.port)
         }
       }
@@ -703,7 +848,7 @@ export class BSVNodeClient extends EventEmitter {
       this._peers.delete(host)
       if (wasBch) {
         // BCH/BTC node — permanent blacklist, never reconnect
-        this._blacklist.add(host)
+        this._blacklistAdd(host)
       } else {
         // Track consecutive failures for good peers
         if (this._goodPeers.has(host)) {
@@ -753,7 +898,10 @@ export class BSVNodeClient extends EventEmitter {
           }
         }
         if (relayCount > 0) {
-          console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate)`)
+          _relayLogCounter++
+          if (_relayLogCounter % 100 === 0) {
+            console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate) [sampled 1/100, total=${_relayLogCounter}]`)
+          }
         }
         // Fetch full tx from source (arrives later, stored in _txCache by tx handler)
         peer.requestTxs(newTxids)
@@ -801,8 +949,8 @@ export class BSVNodeClient extends EventEmitter {
         // DNS failed during maintenance — try again next cycle
       }
 
-      // Addr pool peers
-      for (const entry of this._addrPool) {
+      // Addr pool peers — iterate keys (Map yields [k,v] tuples by default)
+      for (const entry of this._addrPool.keys()) {
         const [host, portStr] = entry.split(':')
         if (!this._peers.has(host) && !toConnect.some(a => a.host === host)) {
           toConnect.push({ host, port: parseInt(portStr, 10) })
@@ -862,9 +1010,15 @@ export class BSVNodeClient extends EventEmitter {
     try {
       const data = JSON.parse(readFileSync(this._persistPath, 'utf8'))
       for (const entry of data) {
-        // Only load peers seen in last 24 hours
+        // Only load peers seen in last 24 hours.
+        // g-261 IPv6 P2P: normalize host so any accidentally-bracketed IPv6
+        // entries (e.g. "[2001:db8::1]") collapse to the same key as bare
+        // form. Map lookup-by-host stays unambiguous across formats.
+        // Pack #2 V3: skip entries with non-string host (would crash keyFor).
         if (Date.now() - entry.lastSeen < 86400000) {
-          this._goodPeers.set(entry.host, { port: entry.port || 8333, lastSeen: entry.lastSeen })
+          const host = normalizeHost(entry.host)
+          if (host === null) continue
+          this._goodPeers.set(host, { port: entry.port || 8333, lastSeen: entry.lastSeen })
         }
       }
       if (this._goodPeers.size > 0) {

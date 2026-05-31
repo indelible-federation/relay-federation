@@ -2,6 +2,33 @@ import { EventEmitter } from 'node:events'
 import { createConnection } from 'node:net'
 import { createHash, randomBytes } from 'node:crypto'
 
+// g-261 IPv6 P2P — filter unroutable IPv6 addresses received via BSV addr exchange.
+// Drop unspecified ::, loopback ::1, IPv4-mapped (handled separately by isIPv4
+// branch above), link-local fe80::/10, ULA fc00::/7, multicast ff00::/8.
+// Global unicast (2000::/3) and everything else routable passes through.
+// raw is a 16-byte Buffer holding the BSV addr-message IP field.
+function isRoutableIPv6 (raw) {
+  if (raw.equals(Buffer.alloc(16))) return false                                  // ::
+  if (raw.slice(0, 15).equals(Buffer.alloc(15)) && raw[15] === 1) return false    // ::1
+  if (raw[10] === 0xff && raw[11] === 0xff) return false                          // IPv4-mapped
+  if (raw[0] === 0xfe && (raw[1] & 0xc0) === 0x80) return false                   // fe80::/10
+  if ((raw[0] & 0xfe) === 0xfc) return false                                      // fc00::/7
+  if (raw[0] === 0xff) return false                                               // ff00::/8
+  return true
+}
+
+// g-261 IPv6 P2P — format 16 raw bytes as colon-separated 4-hex groups.
+// Pack #2 V3: validate input is a 16-byte Buffer. Returns null on bad input
+// so callers can skip rather than crash on readUInt16BE OOB.
+function formatIPv6 (raw) {
+  if (!Buffer.isBuffer(raw) || raw.length !== 16) return null
+  const groups = []
+  for (let i = 0; i < 16; i += 2) {
+    groups.push(raw.readUInt16BE(i).toString(16).padStart(4, '0'))
+  }
+  return groups.join(':')
+}
+
 /**
  * BSVPeer — single TCP connection to a BSV full node.
  *
@@ -11,6 +38,7 @@ import { createHash, randomBytes } from 'node:crypto'
  * - Transaction fetch via getdata MSG_TX
  * - Keepalive via ping/pong
  *
+ * Ported from production Indelible SPV bridge (p2p.js) with:
  * - Protocol version 70016 with protoconf
  * - User agent /Bitcoin SV:1.1.0/ (matches known clients)
  * - Correct inv-based broadcast (not raw tx push)
@@ -166,6 +194,10 @@ export class BSVPeer extends EventEmitter {
     // Transaction tracking
     this._pendingTxRequests = new Map()
     this._pendingBroadcasts = new Map()
+    // g-254: track the fired-and-forgotten 60s expiry timers from broadcastTx
+    // so _releaseResources can cancel them on disconnect — otherwise the timer
+    // closure captures `this` and pins the peer in external memory.
+    this._broadcastTimers = new Set()
     this._sharedTxCache = opts.sharedTxCache || null
   }
 
@@ -295,6 +327,35 @@ export class BSVPeer extends EventEmitter {
     }
     this._connected = false
     this._handshakeComplete = false
+    this._releaseResources()
+  }
+
+  /**
+   * Release per-peer C-allocated buffers + pending request state to prevent
+   * V8 retention leaks on peer churn (g-254).
+   *
+   * Why: when a peer disconnects — especially during the "dropped before
+   * handshake" storm against banned/incompatible peers — the parent's
+   * this._peers.delete(host) removes its Map reference, but lingering
+   * closures (in-flight pending-tx Promise resolvers, accumulated socket
+   * Buffer, cached broadcast rawHex) can keep the peer object alive via
+   * V8 retention. Explicitly dropping those heavy fields breaks the
+   * retention chain so V8 can free the C-allocated bytes.
+   *
+   * Safe to call multiple times (idempotent). Safe to call before disconnect.
+   * Setting _buffer to a fresh empty Buffer (not null) keeps _onData's
+   * Buffer.concat path crash-safe if a late socket event arrives post-release.
+   */
+  _releaseResources () {
+    this._buffer = Buffer.alloc(0)
+    for (const { reject, timer } of this._pendingTxRequests.values()) {
+      clearTimeout(timer)
+      try { reject(new Error('peer disconnected')) } catch {}
+    }
+    this._pendingTxRequests.clear()
+    this._pendingBroadcasts.clear()
+    for (const timer of this._broadcastTimers) clearTimeout(timer)
+    this._broadcastTimers.clear()
   }
 
   /**
@@ -402,7 +463,14 @@ export class BSVPeer extends EventEmitter {
 
     // Store so we can serve getdata requests from peers
     this._pendingBroadcasts.set(txid, rawTxHex)
-    setTimeout(() => this._pendingBroadcasts.delete(txid), 60000)
+    // g-254: track the timer so _releaseResources can cancel it on disconnect.
+    // Without tracking, the arrow-function closure captures `this` and keeps
+    // the peer alive in external memory for up to 60s after disconnect.
+    const expiryTimer = setTimeout(() => {
+      this._pendingBroadcasts.delete(txid)
+      this._broadcastTimers.delete(expiryTimer)
+    }, 60000)
+    this._broadcastTimers.add(expiryTimer)
 
     // Send inv to announce we have this tx
     const invPayload = Buffer.alloc(37)
@@ -483,12 +551,14 @@ export class BSVPeer extends EventEmitter {
     if (!wasHandshaked) {
       console.log(`[P2P] ${host}:${this._port} dropped before handshake (banned or incompatible)`)
     }
+    this._releaseResources()
     this.emit('disconnected', { host, port: this._port })
   }
 
   // ── Private: data parsing ──────────────────────────────────
 
   _onData (data) {
+    if (this._destroyed) return
     this._buffer = Buffer.concat([this._buffer, data])
     if (!this._draining) this._drainBuffer()
   }
@@ -802,7 +872,19 @@ export class BSVPeer extends EventEmitter {
           addrs.push({ host, port })
         }
       } else {
-        offset += 16 + 2 // skip IPv6 + port
+        // g-261 IPv6 P2P: parse native IPv6 address from 16-byte field.
+        // Defensive bounds check (outer loop guard already enforces this, but
+        // explicit for clarity + future-proofing against loop restructure).
+        if (offset + 16 + 2 > payload.length) break
+        const raw = payload.slice(offset, offset + 16)
+        offset += 16
+        const port = payload.readUInt16BE(offset)
+        offset += 2
+        if (port === 8333 && isRoutableIPv6(raw)) {
+          const host = formatIPv6(raw)
+          // Pack #2 V3: formatIPv6 returns null on bad input; skip rather than push null host
+          if (host !== null) addrs.push({ host, port })
+        }
       }
     }
 

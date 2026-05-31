@@ -52,10 +52,10 @@ If port 9333 is not open, your bridge will work but show as **offline** on the d
 ## Step 3: Install the bridge software
 
 ```bash
-npm install -g @relay-federation/bridge@4.0.0
+npm install -g @relay-federation/bridge@latest
 ```
 
-**Important:** Use version 4.0.0. Version 4.2.5 on npm has a bug where the `/status` endpoint returns Internal Server Error. This will be fixed in the next release.
+**Use 5.1.0 or newer.** It includes native IPv6 peering, `--personal` mode, and two memory-leak fixes that matter for any long-running bridge (see CHANGELOG). Older 4.x and 5.0.x releases are superseded.
 
 This gives you the `relay-bridge` command.
 
@@ -262,6 +262,166 @@ The dashboard automatically proxies cross-bridge requests through your bridge se
 
 ---
 
+## IPv6 Support (Optional)
+
+> **Status:** shipped in 5.1.0. Once you're on 5.1.0+, no config change is required for outbound IPv6 — the bridge uses IPv6 automatically whenever a BSV peer or another bridge is reachable that way. The notes below cover the cases where you want to **accept** inbound IPv6, or where IPv6 lets you escape problems IPv4 can't (peer-from-home behind CGNAT).
+
+### Why IPv6 — and why IPv4 can't run a bridge from home
+
+If you want to run a **full federation bridge from a home internet connection**, IPv6 isn't a nice-to-have — it's the only thing that works. Here's the why, because it trips up everyone who tries IPv4 first:
+
+**The IPv4 problem: CGNAT.** The world ran out of IPv4 addresses years ago (there are only ~4.3 billion, all allocated). To cope, most consumer ISPs — all cellular/5G home internet (T-Mobile, Verizon), most fiber and cable for residential plans — put you behind **Carrier-Grade NAT (CGNAT)**: hundreds or thousands of customers share one public IPv4 address. You don't get a public IPv4 of your own. That means:
+
+- **No inbound connections.** Other bridges and BSV nodes literally cannot reach you on IPv4 — there's no address that routes to your machine.
+- **Port forwarding doesn't help.** You can forward ports on your own router all day; the CGNAT layer upstream (at the ISP) has no forward rule for you, and you can't add one. The packets die before they reach your router.
+- **You can't even buy your way out easily.** A static IPv4 from a residential ISP is often unavailable at any price, or requires a business line.
+
+So a home bridge on IPv4 can make *outbound* connections but can never *accept* inbound gossip — it can't be a full mesh participant. It's stuck as an outbound-only node.
+
+**The IPv6 fix.** IPv6 has 2^128 addresses — about 340 undecillion, enough to give every device on Earth billions of its own. There's no scarcity, so there's no CGNAT: when your ISP gives you IPv6, every device gets a **real, globally-routable address**. Inbound connections work. A home machine becomes directly reachable, exactly like a VPS. That's what turns a home bridge from "outbound-only" into a **full federation member** — accepting inbound gossip, relaying, registered on-chain.
+
+**When even inbound IPv6 is blocked.** Some ISPs (notably T-Mobile Home Internet) hand out IPv6 but firewall *inbound* IPv6 too. We hit this on a real residential connection. The fix is a small IPv6-enabled VPS (any provider, ~$3-6/mo) running as a **WireGuard hub**: it carves a `/128` from its own `/64`, NDP-proxies that address onto its public segment, and tunnels traffic for it to your home machine over WireGuard (UDP — which *does* punch through CGNAT/firewalls because it's outbound-initiated with keepalives). From the internet's view your home bridge has a real routable IPv6 address; in reality it's tunneled. One production federation bridge runs exactly this way. Full recipe in **Path 3** below.
+
+**The other wins (beyond home bridges):**
+- **Future-proofing.** Most VPS providers (Vultr, DigitalOcean, Hetzner, Linode, OVH) offer free IPv6 per-instance. Turning it on means your bridge can peer with IPv6-only BSV nodes and IPv6-only bridges as they come online — the BSV topology already has them (we connect to peers in Hurricane Electric, OVH, and Vultr IPv6 ranges within seconds of startup).
+- **Edge devices.** Once IPv6 is your path, the same bridge software runs on smaller boxes — mini-PCs, NAS, ARM SBCs — without needing a dedicated public IPv4.
+
+### Path 1 — VPS with native IPv6 (typical)
+
+Most providers expose IPv6 via a per-instance toggle in their control panel. Once enabled, your VPS gets a `/64` (massive — billions of addresses, all yours).
+
+**Enable IPv6 on the VPS (provider UI).** For Vultr: instance → Settings → IPv6 → Enable. Other providers similar. After enabling, reboot if the provider docs say to.
+
+**Verify the OS sees it:**
+```bash
+ip -6 addr show scope global
+# You should see a 2000::/3 address on your primary interface.
+```
+
+**Open IPv6 firewall ports** (in addition to the IPv4 ports from Step 2):
+```bash
+# ufw applies rules to both v4 and v6 by default — just confirm:
+sudo grep IPV6 /etc/default/ufw
+# IPV6=yes
+sudo ufw status verbose | grep v6
+# 8333/tcp                   ALLOW IN    Anywhere (v6)
+# 9333/tcp                   ALLOW IN    Anywhere (v6)
+```
+
+If `IPV6=no` in `/etc/default/ufw`, change to `yes` and run `sudo ufw reload`.
+
+**Bridge listens on dual-stack automatically.** The IPv6-enabled bridge software binds `::` (the IPv6 wildcard), which on Linux accepts both v4 AND v6 connections on the same socket. No config flag needed. You'll see this line in the journal on startup:
+
+```
+[P2P] Listening for inbound connections on port 8333 (dual-stack)
+```
+
+**Optional explicit bind config** (only needed if you want to override defaults):
+```json
+{
+  "host": "::",
+  "statusBindAddress": "::"
+}
+```
+
+**Verify external reachability:**
+```bash
+# From any IPv6-reachable host:
+curl -sS "http://[YOUR_V6_ADDR]:9333/health"
+# {"headerHeight": ..., "connectedPeers": ..., "synced": true}
+```
+
+### Path 2 — VPS without IPv6 (still works)
+
+If your provider doesn't offer IPv6, you don't need to do anything. The bridge stays IPv4-only and federates normally. You'll miss some IPv6-only BSV peers and won't be reachable to v6-only bridges, but the mesh keeps working.
+
+### Path 3 — Peer-from-home behind CGNAT (advanced)
+
+If you want to run a bridge from a home machine that has no inbound IPv4 AND no inbound IPv6 (T-Mobile Home Internet, many consumer cellular, most apartment-building shared connections), you can build an IPv6 endpoint by:
+
+1. Renting a small IPv6-enabled VPS as a **WireGuard hub** ($3-6/mo class)
+2. Carving a single `/128` out of the hub's `/64` and **NDP-proxying** it onto the hub's public segment
+3. Forwarding traffic for that `/128` through a WireGuard tunnel to your home machine
+4. Binding your bridge on the home machine to `::`
+
+From the public internet's perspective, your home machine appears to have a real, routable IPv6 address — even though it's actually behind CGNAT and tunneled through your hub.
+
+**Sketch of the hub config** (`/etc/wireguard/wg0.conf` on the VPS):
+```ini
+[Interface]
+PrivateKey = <hub key>
+Address = fd00:cafe::1/64
+ListenPort = 51820
+
+[Peer]
+# Home machine
+PublicKey = <home pubkey>
+AllowedIPs = fd00:cafe::2/128, <carved-/128-from-hub-/64>/128
+```
+
+**Hub system tunables:**
+```bash
+sysctl -w net.ipv6.conf.all.forwarding=1
+sysctl -w net.ipv6.conf.<wan-iface>.proxy_ndp=1
+ip -6 neigh add proxy <carved-/128> dev <wan-iface>
+# Persist both via /etc/sysctl.d/ + a wg-quick PostUp hook.
+```
+
+**Home machine client config** — use **specific** AllowedIPs, NOT `::/0`. On Windows, `AllowedIPs = ::/0` triggers the WireGuard kill-switch and breaks all outbound traffic on the host. Use the hub `/64` plus your provider's `/32` allocation instead:
+
+```ini
+[Interface]
+PrivateKey = <home key>
+Address = fd00:cafe::2/64, <carved-/128>/128
+
+[Peer]
+PublicKey = <hub pubkey>
+Endpoint = <hub-public-ip>:51820
+AllowedIPs = fd00:cafe::/64, 2001:19f0::/32   # Vultr's /32, adjust to your hub provider
+PersistentKeepalive = 25
+```
+
+Once the tunnel is up and the carved address pings from the public internet, point your bridge config at it:
+```json
+{
+  "host": "::",
+  "endpoint": "ws://[<carved-/128>]:8333",
+  "statusBindAddress": "::"
+}
+```
+
+### Common pitfalls
+
+- **AllowedIPs = ::/0 on Windows kills your network.** Always enumerate specific prefixes.
+- **journald → syslog log flood.** Bridges log a lot. If `/var/log/syslog` fills your disk and your bridge OOM-spirals, add this drop-in to keep journald from forwarding to rsyslog:
+  ```bash
+  # /etc/systemd/journald.conf.d/zz-no-syslog-forward.conf
+  [Journal]
+  ForwardToSyslog=no
+  ```
+  Use a `zz-` prefix — vendor drop-ins ship at `/usr/lib/systemd/journald.conf.d/syslog.conf`, and conf.d merges with digits sorting BEFORE letters. A `99-` prefix loses to `syslog.conf`; `zz-` wins.
+- **IPv6 firewall NOT applied.** `IPV6=no` in `/etc/default/ufw` means your v4 rules don't cover v6. Set `IPV6=yes` and `ufw reload`.
+- **`AAAA` resolves but the bridge stays on IPv4.** Older bridge versions resolve seeds via `resolve4()` only. The IPv6-enabled release uses `Promise.allSettled([resolve4, resolve6])` so any IPv6-only seed becomes usable. Confirm you're on the IPv6 release.
+
+### Verifying your IPv6 path is working
+
+Once your bridge is running on the IPv6-enabled release with `host: "::"`:
+
+```bash
+# Confirm dual-stack listener
+sudo ss -tlnp | grep :8333
+# Should show "::8333" (matches both v4 and v6) — not just "0.0.0.0:8333"
+
+# Confirm bridge picked up IPv6 peers
+sudo journalctl -u relay-bridge -n 100 | grep -iE 'ipv6|aaaa|2[0-9a-f]{3}:'
+# Look for outbound connect lines to bracketed v6 addresses
+
+# Confirm /health reachable via v6
+curl -sS "http://[YOUR_V6]:9333/health"
+```
+
+---
+
 ## Files & Directories
 
 | Path | What It Is |
@@ -275,7 +435,7 @@ The dashboard automatically proxies cross-bridge requests through your bridge se
 **Dashboard shows "offline" / HTTP 500 on :9333/status**
 1. Port 9333 not open — `sudo ufw allow 9333/tcp`
 2. Wrong Node.js version — use v22 LTS (`node --version`)
-3. Wrong npm version — use `@relay-federation/bridge@4.0.0` (v4.2.5 has a status bug)
+3. Wrong npm version — use `@relay-federation/bridge@latest` (5.1.0+)
 4. Test locally: `curl http://127.0.0.1:9333/status` — if this fails too, it's a software issue not firewall
 
 **No peers connecting**
@@ -333,7 +493,7 @@ Your config and data are preserved — only the software is updated.
 
 | Issue | Workaround |
 |-------|-----------|
-| v4.2.5 `/status` broken | Install v4.0.0: `npm install -g @relay-federation/bridge@4.0.0` |
+| Memory grows over days | Upgrade to 5.1.0+ — fixes the perMessageDeflate + per-peer leaks |
 | Bun process exits | Use Node.js for runtime (Bun OK for `install`) |
 | `fund` requires raw hex | Get raw hex from whatsonchain.com — auto-detect from address planned |
 | No `--version` flag | Check `npm list -g @relay-federation/bridge` instead |
@@ -349,7 +509,7 @@ The full setup:
 sudo ufw allow 8333/tcp && sudo ufw allow 9333/tcp
 
 # 2. Install
-npm install -g @relay-federation/bridge@4.0.0
+npm install -g @relay-federation/bridge@latest
 
 # 3. Init, fund, register, start
 relay-bridge init
@@ -359,5 +519,29 @@ relay-bridge start
 ```
 
 Your bridge discovers the mesh automatically from the blockchain. No seed peers to configure, no manual setup needed.
+
+---
+
+## Personal Mode — run a bridge without joining the gossip mesh
+
+New in 5.1.0. If you want a bridge for your own use — broadcasting transactions and reading chain data — without accepting inbound federation peers or exposing a public dashboard, use `--personal`:
+
+```bash
+relay-bridge start --personal
+```
+
+Or set it permanently in `~/.relay-bridge/config.json`:
+
+```json
+{ "personal": true }
+```
+
+What personal mode does:
+- **Disables the inbound gossip WebSocket listener** — your bridge connects outward to peers but doesn't accept inbound federation connections. No need to open the gossip port to the world.
+- **Binds the status dashboard to `127.0.0.1`** — the dashboard is reachable only from the machine itself, not the network.
+
+This is the mode for a home machine, a laptop, or any node where you want the bridge's capabilities without running public infrastructure. Combine it with IPv6 (below) if you want a personal bridge that's still reachable for outbound peering from behind CGNAT.
+
+Your explicit `statusBindAddress` and `startGossipListener` config values always win over the personal-mode defaults — set them if you want a custom mix (e.g. personal mode but with the dashboard on the LAN).
 
 Welcome to the federation.

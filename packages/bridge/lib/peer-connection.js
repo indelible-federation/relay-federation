@@ -44,7 +44,9 @@ export class PeerConnection extends EventEmitter {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return
 
     try {
-      this.ws = new WebSocket(this.endpoint)
+      this.ws = new WebSocket(this.endpoint, {
+        perMessageDeflate: false
+      })
       this._attachListeners(this.ws)
     } catch (err) {
       this.emit('error', err)
@@ -77,6 +79,7 @@ export class PeerConnection extends EventEmitter {
     ws.on('open', () => {
       this.connected = true
       this._reconnectDelay = 5000 // reset backoff on success
+      console.log(`[ws-out] ${this.endpoint} extensions="${ws.extensions || ''}"`)
       this.emit('open')
     })
 

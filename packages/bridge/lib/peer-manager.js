@@ -127,19 +127,31 @@ export class PeerManager extends EventEmitter {
    * @param {object} opts
    * @param {number} opts.port - Port to listen on
    * @param {string} [opts.host='0.0.0.0'] - Host to bind to
+   * @param {boolean} [opts.startGossipListener] - When strictly === false, skip
+   *   the inbound WebSocket server entirely (g-192 V3 personal mode). Defaults
+   *   to running. The caller (cli.js applyModeDefaults) owns the default.
    * @returns {Promise<void>}
    */
   startServer (opts) {
+    // g-192 V3: dumb-executor gate. cli.js applyModeDefaults sets this to false
+    // in personal mode; we never default it here (R2 pack catch — defaulting
+    // ?? true would silently re-enable gossip and defeat --personal).
+    if (opts.startGossipListener === false) {
+      return Promise.resolve()
+    }
     return new Promise((resolve, reject) => {
       this._server = new WebSocketServer({
         port: opts.port,
-        host: opts.host || '0.0.0.0'
+        host: opts.host || '0.0.0.0',
+        perMessageDeflate: opts.perMessageDeflate ?? false
       })
 
       this._server.on('listening', () => resolve())
       this._server.on('error', (err) => reject(err))
 
-      this._server.on('connection', (ws) => {
+      this._server.on('connection', (ws, req) => {
+        const remote = req?.socket?.remoteAddress || 'unknown'
+        console.log(`[ws-in] ${remote} extensions="${ws.extensions || ''}"`)
         // Inbound connections: full challenge-response handshake if available,
         // otherwise fall back to basic hello exchange.
         const timeout = setTimeout(() => {

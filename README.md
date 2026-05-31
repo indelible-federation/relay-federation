@@ -12,7 +12,7 @@ We built the same thing for Bitcoin.
 
 **Transactions are the nutrients.** Broadcast to one bridge, and they propagate through the mesh to the entire BSV network.
 
-**9 bridges live. 422 tests passing. 2 continents.**
+**10 bridges live. 422 tests passing. 2 continents — one running from a home connection over IPv6.**
 
 ---
 
@@ -48,8 +48,9 @@ No full node. No third-party API. No single point of failure.
 | 7 | Silicon Valley | 25-32 | 1 peer | 98% hit rate | DNS seed crawler |
 | 8 | Hetzner (EU) | 6+ | 1 peer | — | Community operator |
 | 9 | bitspv.com | 5+ | 1 peer | — | Community operator |
+| 10 | Home (IPv6) | 8+ | 1 peer | yes | Residential — full mesh member over IPv6 (v5.1.0) |
 
-All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
+All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`. **Bridge 10 runs from a residential home connection** — a full mesh participant reachable over IPv6, proving the federation isn't VPS-only (see [Bridge Operator Handbook → IPv6 Support](BRIDGE_OPERATOR_HANDBOOK.md)).
 
 What is a Surety Bond?
 
@@ -142,7 +143,7 @@ Transactions enter through ARC (HTTP POST to Teranode). Bridges hear them come b
 
 | # | Pipe | Transport | Direction | Status |
 |---|------|-----------|-----------|--------|
-| 1 | **Teranode gossip** | libp2p GossipSub | Blocks, subtrees, status IN | Live — all 9 bridges |
+| 1 | **Teranode gossip** | libp2p GossipSub | Blocks, subtrees, status IN | Live — all 10 bridges |
 | 2 | **ARC** | HTTP POST | Transactions OUT to miners | Live |
 | 3 | **Legacy BSV P2P** | TCP wire protocol | Headers, txs, both directions | Live — ban-prone |
 | 4 | **Federation mesh** | WebSocket peering | Tx relay between bridges | Live |
