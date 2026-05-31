@@ -286,7 +286,29 @@ So a home bridge on IPv4 can make *outbound* connections but can never *accept* 
 - **Future-proofing.** Most VPS providers (Vultr, DigitalOcean, Hetzner, Linode, OVH) offer free IPv6 per-instance. Turning it on means your bridge can peer with IPv6-only BSV nodes and IPv6-only bridges as they come online — the BSV topology already has them (we connect to peers in Hurricane Electric, OVH, and Vultr IPv6 ranges within seconds of startup).
 - **Edge devices.** Once IPv6 is your path, the same bridge software runs on smaller boxes — mini-PCs, NAS, ARM SBCs — without needing a dedicated public IPv4.
 
-### Path 1 — VPS with native IPv6 (typical)
+### Which path is yours?
+
+Pick by your situation, not your hardware — a home machine and a VPS follow the same steps when IPv6 works:
+
+| Your situation | Path | What you do |
+|---|---|---|
+| **VPS with IPv6** (Vultr, DO, Hetzner, Linode, OVH…) | **Path 1** | Enable IPv6, open the firewall — done. Full mesh member. |
+| **Home connection where inbound IPv6 works** | **Path 1** | Same steps as a VPS. Test first (below); if it works, you're done — no hub needed. |
+| **VPS or host with no IPv6 at all** | **Path 2** | Stays IPv4-only, federates fine, just misses IPv6-only peers. |
+| **Home connection where your ISP blocks inbound IPv6** (e.g. T-Mobile Home) | **Path 3** | WireGuard-hub workaround. Only needed if the test below fails. |
+
+**Test your home IPv6 BEFORE assuming you need the hub.** Most people with IPv6 can use Path 1 directly. From a *different* network (phone on cellular works), check whether your home machine is reachable:
+
+```bash
+# On the home machine: confirm it has a global IPv6 and the bridge is listening
+ip -6 addr show scope global        # want a 2000::/3 address
+# Start the bridge with "host": "::", then from another network:
+curl -sS "http://[YOUR_HOME_V6]:9333/health"
+```
+
+If that `curl` returns JSON, your ISP allows inbound IPv6 → **use Path 1, skip the hub entirely.** If it times out, your ISP firewalls inbound IPv6 → **Path 3.**
+
+### Path 1 — native IPv6 (VPS *or* home — the easy path)
 
 Most providers expose IPv6 via a per-instance toggle in their control panel. Once enabled, your VPS gets a `/64` (massive — billions of addresses, all yours).
 
