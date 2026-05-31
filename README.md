@@ -107,6 +107,17 @@ relay-bridge start     # syncs headers, connects to mesh, serves API
 
 See the [Bridge Operator Handbook](BRIDGE_OPERATOR_HANDBOOK.md) for the full walkthrough.
 
+### Run from home (IPv6) — no VPS required
+
+As of v5.1.0, a bridge doesn't need a datacenter. A capable PC on a home connection can be a **full mesh member** — accepting inbound peers, relaying, registered on-chain — over IPv6.
+
+**Why IPv6, not IPv4:** the world is out of IPv4 addresses, so consumer ISPs put you behind Carrier-Grade NAT (CGNAT) — you get no public IPv4, nothing can reach you inbound, and port forwarding can't fix it (the NAT is upstream at the ISP). IPv6 has no such scarcity, so every device gets a real routable address and inbound works.
+
+- **ISP gives you working inbound IPv6?** Setup is the same as a VPS — set `"host": "::"` and you're a full member. **Test first** (from another network: `curl http://[YOUR_V6]:9333/health`); if it answers, you're done — no extra tooling.
+- **ISP firewalls inbound IPv6 (e.g. T-Mobile Home Internet)?** A small IPv6 VPS as a **WireGuard hub** tunnels a routable address to your PC over UDP (which punches through CGNAT). One of our 10 bridges runs exactly this way from a residential connection.
+
+Full decision guide + both recipes: [Bridge Operator Handbook → IPv6 Support](BRIDGE_OPERATOR_HANDBOOK.md).
+
 ---
 
 ## Architecture
