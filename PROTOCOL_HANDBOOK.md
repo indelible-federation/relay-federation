@@ -186,6 +186,9 @@ Fields:
 - **healthUrl** (optional) — Local URL for health checks. Use this when your app runs behind nginx on the same VPS. Without it, the bridge health-checks itself through DNS → public IP → TLS → nginx, which can timeout and show false errors. Point this to `http://127.0.0.1:<port>` or `http://127.0.0.1:9333/status` (the bridge itself) to avoid loopback timeouts.
 - **bridgeDomain** — The domain that proxies to your bridge (for request tracking)
 
+### Forest Tab
+The federation rendered as a living mycelial forest. Each BSV peer, app, and bridge is a mushroom on the forest floor with drifting spore particles; hover any entity for its host, user-agent, and block height. Backed by the live `forest` data feed (peers / apps / bridges).
+
 ---
 
 ## Adding a New Protocol
