@@ -4,6 +4,9 @@
   "description": "Federated SPV relay mesh — BSV developer infrastructure",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "workspaces": [
     "packages/*"
   ],

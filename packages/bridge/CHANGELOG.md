@@ -1,6 +1,20 @@
 # Changelog — @relay-federation/bridge
 
-All notable changes to the federation bridge package. Six improvements in 5.1.0: native IPv6 peering (run a full bridge from home), three memory-leak fixes, the LRU peer-set cap, and the gossip/P2P port split.
+All notable changes to the federation bridge package. 5.1.1 catches ARC "STORED" broadcasts that were being silently lost, fixes the @bsv/sdk RNG crash that broke the test suite on older Node (issue #8), and ships the Forest dashboard art.
+
+## 5.1.1 — 2026-06-16
+
+**Broadcast-trust fix + RNG fix + Forest dashboard art.** The bridge no longer treats an ARC HTTP 200 as a successful broadcast — it now requires a real network txStatus — so transactions ARC merely STORED (never relayed) are caught and fall through to the next path instead of being silently lost. It also fixes a crypto-RNG crash that broke the test suite and key generation on Node builds without the Web Crypto global (issue #8), and ships the Forest dashboard tab's art assets. Node 20+ is now required. Drop-in upgrade from 5.1.0 — your config and data are preserved.
+
+### Fixed
+
+- **ARC "STORED" broadcasts no longer counted as success.** ARC returns HTTP 200 + a txid even for a transaction it has only *stored* (persisted but never relayed to the network → permanently lost). The bridge accepted any 200/`res.ok` as broadcast success, silently losing those txs. Broadcast acceptance now gates on the ARC response `txStatus`: only `SENT_TO_NETWORK`, `ACCEPTED_BY_NETWORK`, `SEEN_ON_NETWORK`, or `MINED` count as relayed — i.e. only once a node has actually taken the transaction. A merely-stored or merely-announced status (`STORED`, `ANNOUNCED_TO_NETWORK`, `REQUESTED_BY_NETWORK`) or anything unknown is rejected, and the broadcast falls through to the next path. Covered by a new unit test (`test/arc-relayed.test.js`).
+- **Forest dashboard tab art.** The Forest visualization referenced six image assets (forest floor + bridge/app/peer/ghost mushrooms + spore particle) that were never committed, so the dashboard rendered with broken images. The assets are now included.
+- **@bsv/sdk RNG crash on older Node fixed (issue #8).** Running the test suite (or the bridge) on a Node build that doesn't expose the Web Crypto API as a global threw `No secure random number generator is available in this environment` from `@bsv/sdk` the moment a key was created (`PrivateKey.fromRandom`) — the SDK's `require('crypto')` fallback is dead code under ESM, so it fell through to a stub that throws. The bridge now installs a Web Crypto global from `node:crypto` (`crypto-polyfill.js`) before `@bsv/sdk` loads — at CLI startup and in the test runner — so key generation works on every supported Node version. Thanks @DanielKrawisz for the report.
+
+### Changed
+
+- **Node 20+ required (`engines`).** `package.json` now declares `engines.node >= 20.0.0` (was `>=18`) — Node 20 is the current LTS and the version where the Web Crypto global the SDK relies on is standard. A CI workflow runs the test suite on Node 20 and 22.
 
 ## 5.1.0 — 2026-05-31
 

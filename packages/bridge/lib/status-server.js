@@ -11,6 +11,22 @@ import { handlePostData, handleGetTopics, handleGetData } from './data-endpoints
 import { createPaymentGate } from './x402-middleware.js'
 import { handleWellKnownX402 } from './x402-endpoints.js'
 
+// ARC returns HTTP 200 + a txid all through its lifecycle — including QUEUED/RECEIVED/STORED (not on
+// the network yet) and ANNOUNCED_TO_NETWORK/REQUESTED_BY_NETWORK (ARC sent an INV / a node asked for
+// it, but no node has actually taken the tx). res.ok is NOT acceptance. Count a broadcast as relayed
+// only once a node actually has the tx: SENT_TO_NETWORK (sent to >=1 node), ACCEPTED_BY_NETWORK,
+// SEEN_ON_NETWORK, or MINED. ARC is only a fallback here (P2P/our node first, WhatsOnChain after), so
+// being strict is free — a merely-announced tx falls through to the next path instead of being
+// falsely marked sent.
+const ARC_NETWORK_STATUSES = new Set(['SENT_TO_NETWORK', 'ACCEPTED_BY_NETWORK', 'SEEN_ON_NETWORK', 'MINED'])
+
+// True only if ARC's body reports a real network status (never on res.ok alone — STORED leaks through).
+export async function arcRelayed (arcRes) {
+  if (!arcRes || !arcRes.ok) return false
+  const d = await arcRes.json().catch(() => null)
+  return !!(d && ARC_NETWORK_STATUSES.has(d.txStatus))
+}
+
 /**
  * StatusServer — public-facing HTTP server exposing bridge status and APIs.
  *
@@ -782,7 +798,8 @@ export class StatusServer {
             method: 'POST', headers: { 'Content-Type': 'application/octet-stream' },
             body: buf, signal: AbortSignal.timeout(10000)
           })
-          if (arcRes.ok) { confirmed = true; confirmSource = 'arc' }
+          if (await arcRelayed(arcRes)) { confirmed = true; confirmSource = 'arc' }
+          else console.error('[broadcast] ARC not relayed (STORED/unknown):', txid.slice(0, 16))
         } catch (e) {
           console.error('[broadcast] ARC failed:', txid.slice(0, 16), e.message)
         }
@@ -1840,12 +1857,11 @@ export class StatusServer {
             body: buf,
             signal: AbortSignal.timeout(10000)
           })
-          if (arcRes.ok || arcRes.status === 200) {
+          if (await arcRelayed(arcRes)) {
             confirmed = true
             confirmSource = 'arc'
           } else {
-            const arcErr = await arcRes.text().catch(() => '')
-            console.error('[broadcast] ARC rejected:', txid.slice(0, 16), arcRes.status, arcErr.slice(0, 200))
+            console.error('[broadcast] ARC not relayed (STORED/unknown):', txid.slice(0, 16), arcRes.status)
           }
         } catch (e) {
           console.error('[broadcast] ARC failed:', txid.slice(0, 16), e.message)

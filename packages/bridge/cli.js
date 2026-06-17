@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// Web Crypto polyfill must load before @bsv/sdk — see crypto-polyfill.js (issue #8)
+import './crypto-polyfill.js'
 import { join } from 'node:path'
 import { initConfig, loadConfig, configExists, defaultConfigDir } from './lib/config.js'
 import { PeerManager } from './lib/peer-manager.js'

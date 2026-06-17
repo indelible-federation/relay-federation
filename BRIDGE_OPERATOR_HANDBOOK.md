@@ -444,6 +444,111 @@ curl -sS "http://[YOUR_V6]:9333/health"
 
 ---
 
+## Running a bridge from home — what actually trips people up
+
+The IPv6 section above is the theory. This section is the field guide: the handful of things that confuse *every* operator who brings a bridge up from a home connection. If your bridge is on a VPS, you can skip this — it just works. If it's on a home PC, read this first.
+
+### The #1 confusion: "I'm in the mesh, but my neighbor's dashboard doesn't show me"
+
+This is normal, and it's the single most common question. Here's why it happens.
+
+A mesh connection has two directions, and they are **completely independent**:
+
+- **Outbound** — *you* dial *them*. This works from almost anywhere, even behind the strictest NAT/CGNAT, because your router lets your own outbound connections out. The moment your bridge starts, it reads the on-chain registry and dials every bridge it finds. So **your** dashboard fills up with peers and looks healthy.
+- **Inbound** — *they* dial *you*. This only works if the address you advertise on-chain is actually reachable from the outside on your bridge's port. Behind NAT/CGNAT with no port-forward and no routable IPv6, **nobody can dial in.**
+
+So the asymmetry is:
+
+> **Your dashboard shows everyone (you dialed them). Their dashboards don't show you (they can't dial you back).**
+
+You appear *connected* to yourself but *invisible* to the mesh's named-bridge lists. Your outbound connection still relays fine — you're not broken — but you're a leaf, not a full member, until inbound works.
+
+**How to read it on the two dashboards side by side:**
+- On **your** node's dashboard: high node count, your neighbors all listed. ✅ (outbound is working)
+- On a **neighbor's** dashboard: your bridge missing from the named sidebar, even though it's in the raw peer list by pubkey. ❌ (inbound is failing — they probed your advertised endpoint and couldn't reach it)
+
+If you see exactly that split, the usual diagnosis is **your advertised endpoint isn't dialable from outside.** Fix inbound (port-forward, or routable IPv6, or the Path 3 hub) and you'll appear on everyone's dashboard within a scan cycle.
+
+**But there's a second, sneakier cause of the same symptom: a non-default status port.** Even when your inbound gossip is fully reachable, other operators' dashboards build their *named* bridge list by fetching each bridge's **status API**, and `/discover` advertises that URL on the default status port **9333** for everyone. If you run your status server on any other port (say `9334`), every other dashboard probes `http://[you]:9333/status`, gets nothing, and silently drops you from the named list — even though your gossip connection is alive and you're relaying fine. You'll appear in raw peer counts but never as a named tile.
+
+The fix is to keep your status port at the default **9333**:
+```json
+{ "statusPort": 9333 }
+```
+This bit a real home bridge: a full BSV/SV node already owned `8333`, so the operator shifted *both* the bridge's gossip port (→ `8334`) *and* its status port (→ `9334`) as a pair — but `9333` was actually free. Only the gossip port needed to move; bumping the status port made the node invisible-by-name on every other dashboard. Moving `statusPort` back to `9333` (and restarting) made it appear everywhere within one poll cycle. Confirm from an outside host:
+```bash
+curl -sS --max-time 8 "http://[YOUR_ADVERTISED_HOST]:9333/status"   # must return your bridge JSON
+```
+If you genuinely cannot free `9333`, you'll keep relaying but won't get a named tile on neighbors' dashboards until the discovery layer learns your real status port — so free `9333` if you possibly can.
+
+**Confirm it in one command** from any outside host (a VPS, or your phone on cellular):
+```bash
+curl -sS --max-time 8 "http://[YOUR_ADVERTISED_HOST]:YOUR_PORT/health"
+```
+JSON back → inbound works, you'll show up everywhere. Timeout → inbound is closed, keep reading.
+
+### Diagnose by your ISP — the three real cases
+
+Home connections fall into three buckets. Find yours.
+
+#### Case A — Real public IPv4 (most cable/fiber: Comcast/Xfinity, etc.)
+
+You have a real, routable public IPv4. Inbound just needs a **port-forward** on your router: forward TCP **8333** (your bridge's P2P port) to your PC's LAN address. Then your IPv4 advertised endpoint becomes dialable and you're a full member.
+
+Gotchas seen in the field:
+- **The setting may not be in the browser.** On Xfinity, port-forwarding lives in the **Xfinity mobile app** (Wi-Fi → View Network → Advanced Settings → Port Forwarding), *not* the `10.0.0.1` web page. Other ISPs vary — if the router web UI has no port-forward page, check the ISP's app.
+- Forward to a **pinned** LAN IP (see Case B) or the rule breaks every time DHCP renews.
+
+#### Case B — Dual-stack with IPv6 (e.g. Deutsche Telekom + Fritz!Box)
+
+You have both IPv4 and IPv6. Two things bite here:
+
+1. **IPv6 privacy extensions rotate your address out from under you.** By default many OSes (and the Fritz!Box) hand out a *temporary* IPv6 suffix that rotates every day or so (RFC 4941). You register your bridge advertising today's address; tomorrow the suffix rotates and your advertised endpoint points at nothing. Fix on the bridge machine:
+   ```powershell
+   # Windows — stop the suffix from rotating
+   netsh interface ipv6 set global randomizeidentifiers=disabled
+   netsh interface ipv6 set privacy state=disabled
+   ```
+   ```bash
+   # Linux — disable temp addresses on the WAN iface
+   sysctl -w net.ipv6.conf.all.use_tempaddr=0
+   sysctl -w net.ipv6.conf.<iface>.use_tempaddr=0
+   ```
+2. **Inbound rules are per-protocol.** A Fritz!Box IPv4 port-share does NOT cover IPv6 — they're separate rules. To be reachable on *both* channels you need:
+   - **Pin the PC's local IP:** Home Network → Network → (your PC) → "Always assign this network device the same IPv4 address."
+   - **IPv4 inbound:** Internet → Permit Access → Port Sharing → enable TCP 8333 → 8333 to that PC.
+   - **IPv6 inbound:** a *separate* Port Sharing entry for IPv6 to the same device (Fritz!Box lists the device's IPv6 interface ID once privacy extensions are off).
+
+Pick whichever channel matches the address you registered on-chain. If you advertised your IPv4, the IPv4 port-share is the one that matters; if you advertised IPv6, fix the v6 rule. Best to do both so either path can reach you.
+
+#### Case C — CGNAT cellular (T-Mobile Home Internet, most 5G/LTE home)
+
+No public IPv4 at all, and often inbound IPv6 firewalled too. **Port-forwarding cannot help you** — the block is upstream at the carrier, not on your router. Your options, in order:
+
+1. **Test inbound IPv6 first** (the `curl .../health` test above). If it works, you're secretly Case B — just advertise your IPv6 and add the v6 inbound rule. Many people skip this and over-build.
+2. If inbound IPv6 is firewalled, use the **Path 3 WireGuard hub** (full recipe in the IPv6 section): a small IPv6 VPS carves a `/128`, NDP-proxies it, and tunnels it to your home machine. From the mesh's view you have a real routable IPv6; in reality it's tunneled. This is how a production home bridge runs today.
+
+**The port-collision gotcha (Case C especially):** if you *also* run a full BSV/SV node on the same machine, **it already owns port 8333.** Your bridge can't bind it, so it listens on a different port (e.g. 8334) — but registration may still advertise 8333, so every neighbor dials the wrong port and inbound silently fails. Fix: make the advertised port in `~/.relay-bridge/config.json` match the port the bridge is actually **listening** on:
+```json
+{
+  "port": 8334,
+  "endpoint": "ws://[your-routable-host]:8334"
+}
+```
+Then re-register so the on-chain endpoint carries the right port. (Re-registration reuses your existing stake bond — it does **not** lock a second 1M sats.)
+
+### A fresh home bridge looks half-broken for the first few minutes — that's normal
+
+Right after `start` / re-register, don't panic at any of these:
+- **Low peer count / few named bridges** — discovery is gossip + on-chain scan; it fills in over a scan cycle or two.
+- **Wallet shows 0 sats** — the dashboard wallet balance is cosmetic for relaying; your stake bond is a separate locked UTXO and your bridge relays fine at 0 spendable.
+- **Mesh node counts differ between your dashboard and a neighbor's** — see the asymmetry section above; that's inbound vs outbound, not a fault.
+- **Version banner looks old** (e.g. shows `v4.3.1` when you're running newer) — the version string is read from a cached field and lags a release; cosmetic only.
+
+Give it a few minutes, then run the `curl .../health` test from outside to get the real verdict on inbound.
+
+---
+
 ## Files & Directories
 
 | Path | What It Is |
@@ -464,6 +569,14 @@ curl -sS "http://[YOUR_V6]:9333/health"
 - Make sure port 8333 is open: `ufw allow 8333/tcp`
 - Check that registration completed: look for "Registration broadcast!" in your logs
 - Wait a few minutes — peers discover each other through gossip, it takes time after a restart
+
+**My dashboard shows everyone, but I don't appear on other operators' dashboards**
+Two possible causes — see **"Running a bridge from home → The #1 confusion"** above:
+1. **Inbound closed** (the usual one): your outbound dials work but your advertised endpoint isn't reachable inbound. Diagnose by ISP (port-forward, IPv6 privacy extensions, or the Path 3 hub); confirm with `curl --max-time 8 "http://[YOUR_ADVERTISED_HOST]:PORT/health"` from an outside host.
+2. **Non-default status port**: even with inbound working, if your `statusPort` isn't `9333`, other dashboards probe the wrong port and drop you from the *named* list. Set `"statusPort": 9333` and restart; confirm with `curl --max-time 8 "http://[YOUR_ADVERTISED_HOST]:9333/status"` from outside.
+
+**Neighbors dial the wrong port / I run an SV node on the same box**
+Your bridge couldn't bind 8333 (the SV node owns it) and fell back to another port, but registration still advertises 8333. Make `port` and `endpoint` in `config.json` match the real listening port, then re-register (reuses your existing bond). See the port-collision note in "Running a bridge from home → Case C."
 
 **"Port 8333 already in use — inbound disabled"**
 Previous process hasn't released the port:

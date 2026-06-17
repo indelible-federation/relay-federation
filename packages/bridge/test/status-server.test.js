@@ -29,6 +29,7 @@ function createMockHeaderRelay () {
 function createMockTxRelay () {
   return {
     mempool: new Map(),
+    knownTxids: new Set(),
     seen: new Set()
   }
 }
@@ -57,7 +58,7 @@ describe('StatusServer', () => {
     const status = await server.getStatus()
 
     assert.equal(status.bridge.pubkeyHex, TEST_CONFIG.pubkeyHex)
-    assert.equal(status.bridge.endpoint, undefined) // endpoint is operator-only
+    assert.equal(status.bridge.endpoint, TEST_CONFIG.endpoint) // endpoint is public (advertised to peers, shown on the dashboard)
     assert.equal(status.bridge.meshId, TEST_CONFIG.meshId)
     assert.equal(typeof status.bridge.uptimeSeconds, 'number')
     assert.ok(status.bridge.uptimeSeconds >= 0)
@@ -121,7 +122,7 @@ describe('StatusServer', () => {
     const status = await server.getStatus()
 
     assert.equal(status.bridge.pubkeyHex, null)
-    assert.equal(status.bridge.endpoint, undefined) // endpoint is operator-only
+    assert.equal(status.bridge.endpoint, null) // no endpoint configured
     assert.equal(status.peers.connected, 0)
     assert.equal(status.peers.list.length, 0)
     assert.equal(status.headers.bestHeight, -1)
