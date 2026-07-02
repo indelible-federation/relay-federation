@@ -166,6 +166,12 @@ export class BSVNodeClient extends EventEmitter {
     // Transaction relay — dedup set to prevent relay loops
     this._seenTxids = new Set()
 
+    // g-345 operating mode: fetch (getdata) every globally-inv'd tx body?
+    // true  = self-sufficient/nodeless bridge — needs first-hand mempool view.
+    // false = indexer-backed bridge — invs tracked + own broadcasts served,
+    //         but no global-tx download and no global inv re-relay.
+    this._fetchGlobalTxs = opts.fetchGlobalTxs ?? true
+
     // Shared tx cache for immediate inv relay (Fix 2)
     // When we relay inv before having rawHex, the tx arrives later and goes here.
     // Any peer's getdata handler checks this cache.
@@ -451,7 +457,10 @@ export class BSVNodeClient extends EventEmitter {
       this.emit('tx:inv', { txids, peer: sourcePeer })
       const newTxids = txids.filter(t => !this._seenTxids.has(t))
       for (const t of newTxids) this._seenTxids.add(t)
-      if (newTxids.length > 0 && peer._handshakeComplete) {
+      // g-345: global inv re-relay + tx fetch only in self-sufficient mode.
+      // Indexer-backed bridges track invs (above) but don't download the world
+      // — and don't re-relay invs they won't be able to serve getdata for.
+      if (this._fetchGlobalTxs && newTxids.length > 0 && peer._handshakeComplete) {
         // Fix 2: immediate inv relay (same as outbound handler)
         let relayCount = 0
         for (const [h, p] of this._peers) {
@@ -476,6 +485,16 @@ export class BSVNodeClient extends EventEmitter {
     } catch {
       this._peers.delete(host)
     }
+  }
+
+  /**
+   * True if this txid has been seen on the BSV P2P network (inv or full tx)
+   * within the current dedup window. Public accessor — consumers (cli.js
+   * mesh→P2P relay gate) use this instead of reaching into _seenTxids
+   * (g-345 pack review, attack 5: internal-field coupling).
+   */
+  hasSeenOnNetwork (txid) {
+    return this._seenTxids.has(txid)
   }
 
   /**
@@ -886,7 +905,9 @@ export class BSVNodeClient extends EventEmitter {
       this.emit('tx:inv', { txids, peer: sourcePeer })
       const newTxids = txids.filter(t => !this._seenTxids.has(t))
       for (const t of newTxids) this._seenTxids.add(t)
-      if (newTxids.length > 0 && peer._handshakeComplete) {
+      // g-345: global inv re-relay + tx fetch only in self-sufficient mode
+      // (see inbound handler — indexer-backed bridges track invs, skip the rest).
+      if (this._fetchGlobalTxs && newTxids.length > 0 && peer._handshakeComplete) {
         // Fix 2: Relay inv IMMEDIATELY to other peers, then fetch tx in parallel.
         // Old flow: inv → fetch tx (100ms) → relay inv. We lose the race.
         // New flow: inv → relay inv + fetch tx simultaneously. Win more races.

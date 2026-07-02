@@ -41,6 +41,25 @@ export class TxRelay extends EventEmitter {
     this._knownTxidMax = opts.maxKnownTxids || 10000
     this._knownTxidTtlMs = opts.knownTxidTtlMs || 600000 // 10 min
 
+    // g-345 origin-tag / selective fetch. Mesh tx announces carry an origin:
+    //   'broadcast'  — a real federation write (explicit broadcastTx callers)
+    //   'p2p-relay'  — global-mempool chatter observed from BSV P2P
+    //   (absent)     — an older mesh member that doesn't tag ('untagged')
+    // With selectiveFetch ON (indexer-backed bridges), only 'broadcast'-tagged
+    // announces get their bodies requested; chatter/untagged announces are
+    // tracked as seen but never downloaded — so one self-sufficient mesh member
+    // can't re-import the whole mempool firehose into indexer-backed boxes.
+    // Self-sufficient bridges (default) fetch everything, as always.
+    this._selectiveFetch = opts.selectiveFetch ?? false
+    /** @type {Map<string, string>} txid → origin (for faithful re-announce) */
+    this.txOrigins = new Map()
+    this._txOriginMax = opts.maxTxOrigins || 50000
+    /** @type {Set<string>} txids we've already sent a tx_request for (pack attack 2:
+     *  the fetch-decision is split from seen-dedup so a later 'broadcast' announce
+     *  can rescue a txid first seen as chatter; this set bounds re-requests). */
+    this._requestedTxids = new Set()
+    this._requestedMax = opts.maxRequested || 50000
+
     /** @type {Map<string, Array>} txid → array of confirmation reports from other bridges */
     this.confirmations = new Map()
     this._confirmMax = 5000
@@ -57,12 +76,23 @@ export class TxRelay extends EventEmitter {
    * @param {string} rawHex
    * @returns {number} Number of peers the announce was sent to
    */
-  broadcastTx (txid, rawHex) {
+  broadcastTx (txid, rawHex, origin = 'broadcast') {
     if (this.seen.has(txid)) return 0
     this._trackSeen(txid)
     this._storeTx(txid, rawHex)
+    this._trackOrigin(txid, origin)
     this.emit('tx:new', { txid, rawHex })
-    return this.peerManager.broadcast({ type: 'tx_announce', txid })
+    return this.peerManager.broadcast({ type: 'tx_announce', txid, origin })
+  }
+
+  /**
+   * Toggle selective fetch (g-345). Set true on indexer-backed bridges so only
+   * 'broadcast'-origin announces are downloaded. Settable after construction
+   * because the operating mode is resolved later in startup than TxRelay.
+   * @param {boolean} v
+   */
+  setSelectiveFetch (v) {
+    this._selectiveFetch = !!v
   }
 
   /**
@@ -126,6 +156,15 @@ export class TxRelay extends EventEmitter {
     }
   }
 
+  /** @private — remember a txid's announce origin with LRU eviction (g-345) */
+  _trackOrigin (txid, origin) {
+    if (!origin) return
+    if (this.txOrigins.size >= this._txOriginMax) {
+      this.txOrigins.delete(this.txOrigins.keys().next().value)
+    }
+    this.txOrigins.set(txid, origin)
+  }
+
   /** @private — add txid to seen set with LRU eviction */
   _trackSeen (txid) {
     if (this.seen.has(txid)) return
@@ -180,12 +219,36 @@ export class TxRelay extends EventEmitter {
 
   /** @private */
   _onTxAnnounce (pubkeyHex, msg) {
-    if (this.seen.has(msg.txid)) return
-    this._trackSeen(msg.txid)
+    const origin = msg.origin || 'untagged'
+    this._trackOrigin(msg.txid, origin)
+    const alreadySeen = this.seen.has(msg.txid)
+    if (!alreadySeen) this._trackSeen(msg.txid)
+    if (this.mempool.has(msg.txid)) return // already hold the body
+    if (this._selectiveFetch) {
+      // g-345 selective fetch: only download the bodies of real federation
+      // writes. Chatter ('p2p-relay') and announces from older non-tagging
+      // members ('untagged') are tracked, never fetched. The fetch decision is
+      // deliberately split from seen-dedup (pack attack 2): a 'broadcast'
+      // announce for a txid first seen as chatter still gets fetched —
+      // _requestedTxids bounds this to one tx_request per txid.
+      if (origin !== 'broadcast') return
+      if (this._requestedTxids.has(msg.txid)) return
+    } else if (alreadySeen) {
+      return // classic dedup — self-sufficient behavior unchanged
+    }
+    this._trackRequested(msg.txid)
     const conn = this.peerManager.peers.get(pubkeyHex)
     if (conn) {
       conn.send({ type: 'tx_request', txid: msg.txid })
     }
+  }
+
+  /** @private — remember that we've requested this txid (LRU-capped) */
+  _trackRequested (txid) {
+    if (this._requestedTxids.size >= this._requestedMax) {
+      this._requestedTxids.delete(this._requestedTxids.values().next().value)
+    }
+    this._requestedTxids.add(txid)
   }
 
   /** @private */
@@ -194,7 +257,8 @@ export class TxRelay extends EventEmitter {
     if (rawHex) {
       const conn = this.peerManager.peers.get(pubkeyHex)
       if (conn) {
-        conn.send({ type: 'tx', txid: msg.txid, rawHex })
+        // Include the origin so the requester can re-announce it faithfully
+        conn.send({ type: 'tx', txid: msg.txid, rawHex, origin: this.txOrigins.get(msg.txid) })
       }
     }
   }
@@ -204,9 +268,14 @@ export class TxRelay extends EventEmitter {
     if (!msg.txid || !msg.rawHex) return
     if (this.mempool.has(msg.txid)) return
     this._storeTx(msg.txid, msg.rawHex)
+    const origin = msg.origin || this.txOrigins.get(msg.txid)
+    this._trackOrigin(msg.txid, origin)
     this.emit('tx:new', { txid: msg.txid, rawHex: msg.rawHex })
-    // Re-announce to all peers except the source
-    this.peerManager.broadcast({ type: 'tx_announce', txid: msg.txid }, pubkeyHex)
+    // Re-announce to all peers except the source — preserving the origin tag
+    // (never upgrade chatter to 'broadcast'; absent stays absent)
+    const announce = { type: 'tx_announce', txid: msg.txid }
+    if (origin && origin !== 'untagged') announce.origin = origin
+    this.peerManager.broadcast(announce, pubkeyHex)
   }
 
   /** @private — remote bridge confirmed a tx broadcast */

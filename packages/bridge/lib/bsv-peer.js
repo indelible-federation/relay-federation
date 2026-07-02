@@ -56,6 +56,9 @@ function formatIPv6 (raw) {
  */
 
 // BSV mainnet magic bytes
+// Module-level sample counter for the [P2P novel-relay] log (see _onGetdata).
+let _novelRelayLogCounter = 0
+
 const MAGIC = Buffer.from('e3e1f3e8', 'hex')
 const PROTOCOL_VERSION = 70016
 const USER_AGENT = '/Bitcoin SV:1.2.1/'
@@ -947,7 +950,13 @@ export class BSVPeer extends EventEmitter {
           this._sendMessage('tx', Buffer.from(rawHex, 'hex'))
           this._pendingBroadcasts.delete(txid)
           this.emit('tx:broadcast', txid)
-          console.log(`[P2P novel-relay] ${txid.slice(0, 12)}... accepted by peer`)
+          // Sampled 1/100 — fires per getdata at mempool-firehose rates; unsampled
+          // it was a blocking stdout write per tx on the loop serving HTTP
+          // (fleet flapping, 2026-07-02). Same pattern as the [P2P relay] log.
+          _novelRelayLogCounter = (_novelRelayLogCounter + 1) % Number.MAX_SAFE_INTEGER
+          if (_novelRelayLogCounter % 100 === 0) {
+            console.log(`[P2P novel-relay] ${txid.slice(0, 12)}... accepted by peer [sampled 1/100, total=${_novelRelayLogCounter}]`)
+          }
         }
       }
     }

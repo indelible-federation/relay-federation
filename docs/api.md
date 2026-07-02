@@ -92,6 +92,8 @@ Bridge status summary. Returns operator fields (wallet, address) only when authe
 
 All transactions currently in the bridge mempool, parsed with full protocol support.
 
+**Note:** in the default self-sufficient mode this reflects the global BSV mempool as seen from P2P. If the bridge runs with `fetchGlobalTxs: false` (invs-only mode — see Configuration in the README), the local mempool contains only mesh-relayed and own-broadcast transactions.
+
 **Response:**
 
 ```json

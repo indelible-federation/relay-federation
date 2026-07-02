@@ -495,7 +495,9 @@ async function cmdStart () {
   // ── 2. Core components ────────────────────────────────────
   const peerManager = new PeerManager()
   const headerRelay = new HeaderRelay(peerManager)
-  const txRelay = new TxRelay(peerManager, { bridgeName: config.name })
+  // Seed selective fetch synchronously from explicit config so there is no
+  // fetch-everything window between construction and mode resolution below.
+  const txRelay = new TxRelay(peerManager, { bridgeName: config.name, selectiveFetch: config.fetchGlobalTxs === false })
   const dataRelay = new DataRelay(peerManager)
 
   // ── 2b. Phase 2: Security layer ────────────────────────────
@@ -792,12 +794,31 @@ async function cmdStart () {
     if (ipRes.ok) p2pPublicIp = (await ipRes.json()).ip
   } catch {}
 
+  // Operating mode: by default the bridge is a SELF-SUFFICIENT chain observer —
+  // it getdata's every globally-inv'd tx so it sees the mempool first-hand
+  // without running a node (the core promise: runs standalone). Operators who
+  // run their own node/indexer and serve reads from it can set
+  // fetchGlobalTxs: false in config.json to skip the global mempool fetch:
+  // invs are still tracked, own broadcasts still serve getdata and mesh-relay,
+  // headers still sync — but no global tx bodies are downloaded. On a small
+  // 1-core VPS this is the difference between a pegged CPU at mempool-burst
+  // rates and a near-idle box. Default: true (self-sufficient).
+  const fetchGlobalTxs = (typeof config.fetchGlobalTxs === 'boolean')
+    ? config.fetchGlobalTxs
+    : true
+  console.log(`BSV P2P mode: ${fetchGlobalTxs ? 'self-sufficient (global mempool fetch)' : 'invs-only (fetchGlobalTxs: false)'}`)
+  // Invs-only bridges also fetch mesh tx bodies selectively: only announces
+  // tagged origin:'broadcast' (real federation writes) are downloaded, so a
+  // self-sufficient mesh member's global-mempool chatter isn't re-imported.
+  txRelay.setSelectiveFetch(!fetchGlobalTxs)
+
   const bsvNode = new BSVNodeClient({
     enableInbound: true,
     listenPort: 8333,
     publicIp: p2pPublicIp,
     persistPath: join(dataDir, 'good-peers.json'),
-    crawlerUrl: 'http://66.135.31.144:9333/api/crawler/peers'
+    crawlerUrl: 'http://66.135.31.144:9333/api/crawler/peers',
+    fetchGlobalTxs
   })
 
   // ── 6b-mesh. Bootstrap P2P from federation mesh ──────────
@@ -877,10 +898,12 @@ async function cmdStart () {
     }
   })
 
-  // Feed raw txs from BSV P2P into the mesh relay + address watcher
+  // Feed raw txs from BSV P2P into the mesh relay + address watcher.
+  // Tagged 'p2p-relay': this is global-mempool chatter, not a federation
+  // write — mesh peers running invs-only mode skip downloading it.
   bsvNode.on('tx', ({ txid, rawHex }) => {
     if (!txRelay.seen.has(txid)) {
-      txRelay.broadcastTx(txid, rawHex)
+      txRelay.broadcastTx(txid, rawHex, 'p2p-relay')
     }
   })
 
@@ -1137,18 +1160,32 @@ async function cmdStart () {
     statusServer.addLog(msg)
   })
 
+  // Per-tx logging is SAMPLED 1/100 (same pattern as the [P2P relay] log in
+  // bsv-node-client.js). At mempool-firehose rates (200+ tx/s) two unsampled
+  // console.logs per tx are ~400 blocking journald/pipe writes/sec on the SAME
+  // event loop that serves HTTP — enough to starve /health on a 1-core VPS —
+  // plus ~6.5 GB/day of log churn. The relay behavior itself is unchanged.
+  let _newTxLogN = 0
+  let _meshRelayLogN = 0
   txRelay.on('tx:new', ({ txid, rawHex }) => {
-    const msg = `New tx: ${txid}`
-    console.log(msg)
-    statusServer.addLog(msg)
+    _newTxLogN = (_newTxLogN + 1) % Number.MAX_SAFE_INTEGER
+    if (_newTxLogN % 100 === 0) {
+      const msg = `New tx: ${txid} [sampled 1/100, total=${_newTxLogN}]`
+      console.log(msg)
+      statusServer.addLog(msg)
+    }
 
     // Fix 3: Relay mesh-received txs to BSV P2P peers.
-    // If this tx came from our own BSV P2P, it's already in _seenTxids — skip.
-    // Only relay txs we learned about from the federation mesh.
-    if (rawHex && !bsvNode._seenTxids.has(txid)) {
+    // If the BSV network already has this tx (we saw its inv/body from a BSV
+    // peer), re-broadcasting is redundant — skip. Inv-only entries count on
+    // purpose: an inv from a BSV peer proves the network holds the tx.
+    if (rawHex && !bsvNode.hasSeenOnNetwork(txid)) {
       const relayed = bsvNode.broadcastTx(rawHex)
       if (relayed) {
-        console.log(`[mesh→P2P] ${txid.slice(0, 12)}... relayed to BSV peers`)
+        _meshRelayLogN = (_meshRelayLogN + 1) % Number.MAX_SAFE_INTEGER
+        if (_meshRelayLogN % 100 === 0) {
+          console.log(`[mesh→P2P] ${txid.slice(0, 12)}... relayed to BSV peers [sampled 1/100, total=${_meshRelayLogN}]`)
+        }
       }
     }
   })
