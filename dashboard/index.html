@@ -762,9 +762,9 @@ function generateQR(text) {
 }
 
 // ── Configuration ──────────────────────────────────
+// Point these at the bridge(s) you want to monitor; the mesh self-discovers the rest.
 const SEED_BRIDGES = [
-  { name: 'bridge-alpha', url: 'http://144.202.48.217:9333' },
-  { name: 'bridge-beta', url: 'http://45.63.77.31:9333' }
+  { name: 'bridge-1', url: 'http://your-bridge-host:9333' }
 ];
 let BRIDGES = [...SEED_BRIDGES];
 const POLL_INTERVAL = 5000;

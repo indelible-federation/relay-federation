@@ -172,6 +172,8 @@ sudo systemctl start relay-bridge
 
 **RestartSec=10:** Prevents "port already in use" errors by giving the old process time to release ports.
 
+**Why a supervisor matters (as of 5.3.0):** an unhandled error now exits the bridge (after flushing its store) instead of leaving the process wedged, so systemd (or pm2/docker) restarts it cleanly. If you run the bridge bare with no supervisor, set `BRIDGE_SURVIVE_UNHANDLED=1` to keep the old log-and-continue behavior.
+
 ### Alternative: pm2
 
 ```bash

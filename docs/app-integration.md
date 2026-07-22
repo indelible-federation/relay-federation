@@ -70,10 +70,10 @@ Read + broadcast + session indexing + multi-bridge failover. This is what Indeli
 
 ```javascript
 const BRIDGES = [
-  'http://149.28.243.56:9333',   // delta
-  'http://144.202.48.217:9333',  // alpha
-  'http://45.63.77.31:9333',     // beta
-  'http://45.63.70.235:9333',    // gamma
+  // List the bridge endpoints you read/broadcast through — the mesh self-discovers the
+  // rest, so a few is enough for failover.
+  'http://your-bridge-1:9333',
+  'http://your-bridge-2:9333',
 ]
 
 let roundRobin = 0

@@ -1,7 +1,7 @@
 // Broadcast a raw transaction to the mesh
 // Usage: node broadcast-tx.js <raw-tx-hex>
 
-const API = 'https://relay.indelible.one'
+const API = process.env.RELAY_API_URL || 'http://localhost:9333'
 const KEY = process.env.RELAY_API_KEY || 'relay_sk_your_key_here'
 
 const rawTx = process.argv[2]

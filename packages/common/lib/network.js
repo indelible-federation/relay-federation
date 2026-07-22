@@ -6,7 +6,7 @@
 /**
  * Fetch UTXOs for a given address from the SPV bridge.
  *
- * @param {string} spvEndpoint — Base URL (e.g. "https://relay.indelible.one")
+ * @param {string} spvEndpoint — Base URL (e.g. "http://localhost:9333")
  * @param {string} apiKey — Relay API key
  * @param {string} address — BSV address
  * @returns {Promise<Array<{tx_hash: string, tx_pos: number, value: number, rawHex: string}>>}

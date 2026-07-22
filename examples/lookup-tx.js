@@ -1,7 +1,7 @@
 // Look up a transaction by txid
 // Usage: node lookup-tx.js <txid>
 
-const API = 'https://relay.indelible.one'
+const API = process.env.RELAY_API_URL || 'http://localhost:9333'
 const KEY = process.env.RELAY_API_KEY || 'relay_sk_your_key_here'
 
 const txid = process.argv[2]
