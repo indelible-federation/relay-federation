@@ -90,7 +90,7 @@ function findPaymentOutput (txJson, expectedHash160, minSats) {
  * @param {string} raw
  * @returns {string}
  */
-function normalizePath (raw) {
+export function normalizePath (raw) {
   const collapsed = raw.replace(/\/+/g, '/').replace(/\/$/, '')
   if (!collapsed) return '/'
   const segments = collapsed.split('/')
@@ -158,6 +158,11 @@ export function createPaymentGate (config, store, fetchTx) {
   const pricingMap = config.x402?.endpoints || {}
   const payTo = config.x402?.payTo || ''
   const enabled = !!(config.x402?.enabled && payTo)
+
+  // Routes whose receipts are finalized as fulfilled:false until the handler delivers a
+  // truthful answer (markFulfilled). An unfulfilled receipt is a standing credit — the
+  // same payment txid may retry the SAME route + price.
+  const fulfillmentAware = new Set(config.x402?.fulfillmentAware || [])
 
   const _pending = new Map() // txid → { promise, routeKey, price }
   const _negCache = new Map() // txid → { expiry, reason, status }
@@ -280,6 +285,17 @@ export function createPaymentGate (config, store, fetchTx) {
       // Atomic claim in LevelDB — put-if-absent (u!{txid} key)
       const claim = await store.claimTxid(txid, { routeKey, price, createdAt: Date.now() })
       if (!claim.ok) {
+        // A finalized-but-UNFULFILLED receipt is a standing credit (the caller paid, our
+        // backend failed to answer). Allow an idempotent retry for the SAME route at the
+        // SAME price — payment was already verified; the key never left the store, so
+        // replay protection is intact.
+        if (typeof store.getPaymentReceipt === 'function') {
+          const existing = await store.getPaymentReceipt(txid)
+          if (existing && existing.status === 'receipt' && existing.fulfilled === false &&
+              existing.endpointKey === routeKey && Number(existing.satoshisRequired) === Number(price)) {
+            return { ok: true, receipt: existing, retry: true }
+          }
+        }
         return { ok: false, status: 402, body: { error: 'already_used' } }
       }
 
@@ -328,6 +344,10 @@ export function createPaymentGate (config, store, fetchTx) {
           confirmed: false,
           confirmedHeight: null
         }
+        // Fulfillment-aware routes start unfulfilled; the route handler calls markFulfilled()
+        // once it delivers a truthful answer. Other routes keep legacy semantics (no fulfilled
+        // field = fulfilled on payment).
+        if (fulfillmentAware.has(routeKey)) receipt.fulfilled = false
         await store.finalizePayment(txid, receipt)
         return { ok: true, receipt }
       } catch (err) {

@@ -862,18 +862,30 @@ export class PersistentStore extends EventEmitter {
   /**
    * Atomic claim — put-if-absent. Returns { ok: true } if claimed,
    * { ok: false } if txid already exists (replay blocked).
+   *
+   * abstract-level has NO `ifNotExists` put option — it is silently ignored, so a
+   * naive put ALWAYS claims (every replay overwrites the prior claim and re-passes
+   * the gate). Emulated atomically instead: LevelDB is single-process (it holds an
+   * exclusive lock on its directory, so no second process can open this store), and
+   * the in-process lock below makes the get→put critical section non-interleavable
+   * for the same txid within the process. That is sufficient here — a cross-process
+   * lock would be unreachable, because the backing store cannot be opened twice.
    */
   async claimTxid (txid, { routeKey, price, createdAt }) {
     const key = `u!${txid}`
+    if (!this._claimLocks) this._claimLocks = new Set()
+    if (this._claimLocks.has(key)) return { ok: false }
+    this._claimLocks.add(key)
     try {
-      await this._paymentReceipts.put(key,
-        { status: 'claimed', routeKey, price, createdAt },
-        { ifNotExists: true })
+      const existing = await this._paymentReceipts.get(key).catch(() => undefined)
+      if (existing != null) return { ok: false }
+      await this._paymentReceipts.put(key, { status: 'claimed', routeKey, price, createdAt })
       return { ok: true }
     } catch (err) {
-      if (err.code !== 'LEVEL_KEY_EXISTS' && err?.cause?.code !== 'LEVEL_KEY_EXISTS')
-        console.error(`[x402] unexpected claimTxid error for ${txid}:`, err.message)
+      console.error(`[x402] unexpected claimTxid error for ${txid}:`, err.message)
       return { ok: false }
+    } finally {
+      this._claimLocks.delete(key)
     }
   }
 
@@ -895,6 +907,46 @@ export class PersistentStore extends EventEmitter {
    */
   async finalizePayment (txid, receipt) {
     await this._paymentReceipts.put(`u!${txid}`, { ...receipt, status: 'receipt' })
+  }
+
+  /**
+   * Read a payment record (claim or receipt). Returns null if absent. Lets the gate
+   * inspect an existing receipt on a claim conflict (fulfillment-aware retry) without
+   * touching the permanence invariant.
+   */
+  async getPaymentReceipt (txid) {
+    try {
+      return await this._paymentReceipts.get(`u!${txid}`) || null
+    } catch (err) {
+      // Absent key = legitimate null. A REAL DB error must be visible, not masked as "not found"
+      // (callers still treat null as fail-safe "deny the retry" — but the failure is now logged).
+      if (!(err && (err.code === 'LEVEL_NOT_FOUND' || err.notFound))) {
+        console.error(`[x402] getPaymentReceipt DB error for ${txid}:`, err && err.message)
+      }
+      return null
+    }
+  }
+
+  /**
+   * Mark a fulfillment-aware receipt as fulfilled (the service delivered a truthful
+   * answer). Flips the flag IN PLACE — the key is never deleted, so replay protection
+   * is untouched. Idempotent; no-op for claims / missing keys. Callers AWAIT this so a
+   * credit can't silently stay open after we answer. Never throws — returns false + logs
+   * LOUDLY on failure (an unconsumed credit = free re-serves of this answer until the
+   * store recovers; that must be visible, not swallowed).
+   */
+  async markFulfilled (txid) {
+    const key = `u!${txid}`
+    try {
+      const val = await this._paymentReceipts.get(key)
+      if (val && val.status === 'receipt' && val.fulfilled === false) {
+        await this._paymentReceipts.put(key, { ...val, fulfilled: true, fulfilledAt: Date.now() })
+      }
+      return true
+    } catch (err) {
+      console.error(`[x402][ALERT] markFulfilled FAILED for ${txid} — credit remains redeemable:`, err.message)
+      return false
+    }
   }
 
   /**

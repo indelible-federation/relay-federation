@@ -1,6 +1,35 @@
 # Changelog — @relay-federation/bridge
 
-All notable changes to the federation bridge package. 5.1.1 catches ARC "STORED" broadcasts that were being silently lost, fixes the @bsv/sdk RNG crash that broke the test suite on older Node (issue #8), and ships the Forest dashboard art.
+All notable changes to the federation bridge package. 5.3.0 is a security + reliability release — an SSRF guard on the dashboard proxy, bounded request bodies + broadcast rate-limiting, peer-mesh connection caps, a pinned and circuit-broken Teranode feed, an x402 payment-replay fix, and no hosted default endpoint.
+
+## 5.3.0 — 2026-07-22
+
+**Security + reliability hardening.** A batch of fixes that close request-handling and peer-mesh attack surface, make broadcasts and payments more robust, and stop the bridge from depending on any hosted default endpoint. Drop-in upgrade from 5.2.0 — your config and data are preserved. One behavior change to note (unhandled-error exit, below); everything else is transparent.
+
+### Security
+
+- **SSRF guard on the dashboard mesh proxy.** `GET /mesh/proxy` previously validated only the request *path* before fetching, so a crafted `url=` could reach cloud-metadata endpoints (169.254.169.254), loopback, or private-range hosts. It now resolves the target host and rejects private / loopback / link-local / CGNAT / multicast addresses (IPv4 and IPv6, including 6to4/Teredo tunnels), pins the connection to the validated IP so a DNS rebind can't swap in an internal address between check and fetch, refuses to follow redirects, and caps the upstream response size.
+- **Request bodies are bounded.** The HTTP body reader was an unbounded accumulator — any POST could grow memory without limit. Control routes now cap at 256 KiB and broadcast routes at 24 MiB (enough for a full raw transaction), returning `413` past the limit. Also fixes a latent multi-byte-UTF-8 decode bug and a hung-request leak on a dropped connection.
+- **Per-IP rate limiting on broadcast**, and a **pre-handshake connection cap** so a flood of unauthenticated sockets can't exhaust file descriptors before the handshake runs.
+- **Inbound WebSocket frames are size-capped** (the `ws` default is 100 MiB) so a peer can't push an oversized frame.
+- **Operator dashboard no longer loads code from a third-party CDN.** Three.js and its controls are now vendored into the package and served locally, and the dashboard sends a Content-Security-Policy — so no external host can inject executable code into the origin that holds your operator secret.
+
+### Fixed
+
+- **Duplicate broadcasts count as success, not failure.** A transaction already in the mempool was being reported as a failed broadcast, which could make a client rebuild and resend it on the same inputs — a self-inflicted double-spend. An "already known" response is now correctly treated as success.
+- **Unparseable relayed transactions no longer crash the bridge.** A non-standard or oversized transaction on the relay path could throw an unhandled error and take the process down; it is now skipped.
+- **x402 payment replay fixed.** The atomic claim relied on a LevelDB put option that is silently ignored, so a claim never actually blocked a replay. Claims are now enforced with a read-check under an in-process lock. Adds fulfillment-aware receipts: a route can leave a receipt open until it has delivered a real answer, so a caller isn't charged for a failed response.
+- **Teranode feed pinned to a working version.** `@bsv/teranode-listener` is now pinned to exactly `1.0.1`; a newer release does not connect to the current public network and would silently kill the feed. A reconnect circuit-breaker also stops the underlying package's unbounded reconnect loop from pegging CPU on a resource-tight host when the feed is unreachable.
+- **Config is validated at load time** — a mistyped `personal`, `startGossipListener`, or `statusBindAddress` field now fails loudly instead of misbehaving later.
+
+### Changed
+
+- **No hosted default endpoints.** The generated config no longer defaults `spvEndpoint` or `crawlerUrl` to a hosted URL — both are empty by default, and registry / crawler peer discovery is skipped (falling back to DNS seeds + the built-in fallback nodes) unless you set your own. The bridge never phones a default host.
+- **Unhandled errors now exit the process** so a supervisor (systemd `Restart=always`, pm2, docker restart-policy) can restart cleanly, instead of leaving the bridge wedged. **This is a behavior change from 5.2.x:** if you run the bridge bare with no supervisor, set `BRIDGE_SURVIVE_UNHANDLED=1` to keep the previous log-and-continue behavior.
+
+## 5.2.0 — 2026-07-02
+
+**Operating modes + mesh efficiency.** Adds an invs-only operating mode (`fetchGlobalTxs`) for bridges that don't need the full global transaction feed, origin-tagged mesh announcements, and per-transaction log sampling to reduce load on resource-constrained bridges.
 
 ## 5.1.1 — 2026-06-16
 

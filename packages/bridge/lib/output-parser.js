@@ -152,7 +152,18 @@ export function addressToHash160 (address) {
  * @returns {{ txid: string, matches: Array<{ vout: number, satoshis: number, scriptHex: string, hash160: string }>, spends: Array<{ prevTxid: string, prevVout: number }> }}
  */
 export function checkTxForWatched (rawHex, watchedHash160s) {
-  const parsed = parseTx(rawHex)
+  // The relay path feeds this ARBITRARY network txs, so a parse failure is an EXPECTED
+  // condition, not a fatal one. A non-standard / oversized tx (e.g. a field past JS's 53-bit
+  // safe-int limit, which @bsv/sdk's BigNumber.toNumber throws on) must never take the bridge
+  // down — without this guard the throw becomes an unhandled rejection and the process
+  // fail-fast-exits. Such a tx simply can't be matched against watched addresses, so skip it.
+  let parsed
+  try {
+    parsed = parseTx(rawHex)
+  } catch (err) {
+    console.warn(`[output-parser] skipping unparseable tx: ${err && err.message}`)
+    return { txid: null, matches: [], spends: [] }
+  }
 
   const matches = parsed.outputs
     .filter(o => o.isP2PKH && watchedHash160s.has(o.hash160))

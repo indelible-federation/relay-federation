@@ -817,7 +817,7 @@ async function cmdStart () {
     listenPort: 8333,
     publicIp: p2pPublicIp,
     persistPath: join(dataDir, 'good-peers.json'),
-    crawlerUrl: 'http://66.135.31.144:9333/api/crawler/peers',
+    crawlerUrl: config.crawlerUrl || null, // operator-supplied crawler endpoint; unset = crawler peer-discovery off (never a default host)
     fetchGlobalTxs
   })
 
@@ -1041,13 +1041,22 @@ async function cmdStart () {
       let peers = await loadPeerCache(cachePath)
 
       if (!peers) {
-        const entries = await scanRegistry({
-          spvEndpoint: config.spvEndpoint,
-          apiKey: config.apiKey
-        })
-        peers = buildPeerList(entries)
-        peers = excludeSelf(peers, config.pubkeyHex)
-        await savePeerCache(peers, cachePath)
+        if (!config.spvEndpoint) {
+          // Fail closed: with no operator-supplied SPV/registry endpoint we do NOT phone a
+          // default host to discover federation peers. Peer discovery falls back to the DNS
+          // seeds + fallback nodes; set config.spvEndpoint to your own endpoint to enable
+          // registry-based federation discovery.
+          console.warn('[registry] no spvEndpoint configured — skipping registry peer discovery')
+          peers = []
+        } else {
+          const entries = await scanRegistry({
+            spvEndpoint: config.spvEndpoint,
+            apiKey: config.apiKey
+          })
+          peers = buildPeerList(entries)
+          peers = excludeSelf(peers, config.pubkeyHex)
+          await savePeerCache(peers, cachePath)
+        }
       }
 
       console.log(`Found ${peers.length} peers`)
@@ -1252,12 +1261,27 @@ async function cmdStart () {
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
-  process.on('uncaughtException', (err) => {
-    console.log(`Uncaught exception: ${err.message}`)
-  })
-  process.on('unhandledRejection', (err) => {
-    console.log(`Unhandled rejection: ${err && err.message ? err.message : err}`)
-  })
+  // Don't swallow-and-continue by default. The old handlers logged and kept the process alive,
+  // so a fatal left the bridge wedged in an undefined state — and because it never exited, a
+  // supervisor (systemd Restart=always, pm2, docker restart-policy) never restarted it, so only
+  // a MANUAL restart recovered it. Log → best-effort flush the store → exit(1) so the supervisor
+  // heals cleanly. Re-entrancy-guarded so a fault during the flush can't loop.
+  // BREAKING vs 5.2.x: set BRIDGE_SURVIVE_UNHANDLED=1 to keep the old log-and-continue behavior
+  // (e.g. a bare run with no supervisor).
+  const _surviveUnhandled = process.env.BRIDGE_SURVIVE_UNHANDLED === '1'
+  let _fatalExiting = false
+  const _fatalExit = (label, err) => {
+    if (_surviveUnhandled) { console.log(`${label} (surviving): ${err && err.message ? err.message : err}`); return }
+    if (_fatalExiting) return
+    _fatalExiting = true
+    console.log(`${label}: ${err && err.message ? err.message : err}`)
+    if (err && err.stack) console.log(err.stack)
+    Promise.resolve(store.close()).catch(() => {}).finally(() => process.exit(1))
+    // Hard backstop: if the flush hangs, still exit.
+    setTimeout(() => process.exit(1), 3000).unref()
+  }
+  process.on('uncaughtException', (err) => { _fatalExit('Uncaught exception', err) })
+  process.on('unhandledRejection', (err) => { _fatalExit('Unhandled rejection', err) })
 }
 
 async function cmdStatus () {

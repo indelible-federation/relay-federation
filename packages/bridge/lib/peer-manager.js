@@ -140,23 +140,55 @@ export class PeerManager extends EventEmitter {
       return Promise.resolve()
     }
     return new Promise((resolve, reject) => {
+      // Cap inbound WS frames (ws default is 100 MiB). Sized to the largest tx a bridge would
+      // relay/broadcast, so a legitimate tx frame is never torn down while a giant abuse frame
+      // (that we'd Buffer.concat + JSON.parse whole) is refused at the transport layer. This is
+      // the WS FRAME cap — a separate ceiling from the HTTP request-body caps in status-server.js.
+      const WS_MAX_FRAME_BYTES = 24 * 1024 * 1024
       this._server = new WebSocketServer({
         port: opts.port,
         host: opts.host || '0.0.0.0',
-        perMessageDeflate: opts.perMessageDeflate ?? false
+        perMessageDeflate: opts.perMessageDeflate ?? false,
+        maxPayload: WS_MAX_FRAME_BYTES
       })
 
       this._server.on('listening', () => resolve())
       this._server.on('error', (err) => reject(err))
 
+      // Pre-handshake connection cap. The handshake gates WHO becomes a peer, but nothing bounds
+      // how many UN-authenticated sockets can be held open at once — a flood would exhaust file
+      // descriptors before the handshake ever runs. Track pre-auth sockets per source IP and
+      // globally; drop new ones past the cap; release the slot on handshake-complete or on close.
+      const preAuth = new Map() // ip -> Set<ws>
+      let preAuthTotal = 0
+      const MAX_PRE_AUTH_PER_IP = opts.maxPreAuthPerIp ?? 10
+      const MAX_PRE_AUTH_TOTAL = opts.maxPreAuthTotal ?? 300
+
       this._server.on('connection', (ws, req) => {
         const remote = req?.socket?.remoteAddress || 'unknown'
+        // enforce the pre-auth cap before doing any work for this socket
+        const ipSet = preAuth.get(remote) || new Set()
+        if (ipSet.size >= MAX_PRE_AUTH_PER_IP || preAuthTotal >= MAX_PRE_AUTH_TOTAL) {
+          ws.close()
+          return
+        }
+        ipSet.add(ws); preAuth.set(remote, ipSet); preAuthTotal++
+        let _preAuthReleased = false
+        const releasePreAuth = () => {
+          if (_preAuthReleased) return
+          _preAuthReleased = true
+          const s = preAuth.get(remote)
+          if (s) { s.delete(ws); if (s.size === 0) preAuth.delete(remote) }
+          preAuthTotal = Math.max(0, preAuthTotal - 1)
+        }
+        ws.once('close', releasePreAuth)
         console.log(`[ws-in] ${remote} extensions="${ws.extensions || ''}"`)
         // Inbound connections: full challenge-response handshake if available,
         // otherwise fall back to basic hello exchange.
         const timeout = setTimeout(() => {
           ws.close() // No hello within 10 seconds
         }, 10000)
+        timeout.unref?.() // an idle pre-auth timeout shouldn't pin process exit (clean shutdown/tests)
 
         ws.once('message', (data) => {
           clearTimeout(timeout)
@@ -182,6 +214,7 @@ export class PeerManager extends EventEmitter {
 
               // Wait for verify
               const verifyTimeout = setTimeout(() => { ws.close() }, 10000)
+              verifyTimeout.unref?.()
               ws.once('message', (data2) => {
                 clearTimeout(verifyTimeout)
                 try {
@@ -220,6 +253,7 @@ export class PeerManager extends EventEmitter {
                   }
                   const conn = this.acceptPeer(ws, result.peerPubkey, msg.endpoint)
                   if (conn) {
+                    releasePreAuth() // authenticated — no longer counts against the pre-auth cap
                     this.emit('peer:connect', { pubkeyHex: result.peerPubkey, endpoint: msg.endpoint })
                     conn.emit('message', msg)
                   }
@@ -228,9 +262,14 @@ export class PeerManager extends EventEmitter {
                 }
               })
             } else {
-              // Legacy hello — accept without crypto verification
+              // Legacy hello — accepted without crypto verification for now (dual-stack). This
+              // path is DEPRECATED and will be hard-rejected in a future release; warn so operators
+              // upgrade their peers to the crypto handshake before it is removed. (Hard-rejecting
+              // now would partition a mixed-version mesh during an upgrade.)
+              console.warn(`[ws-in] DEPRECATED legacy (no-crypto) hello from ${msg.pubkey ? msg.pubkey.slice(0, 16) : '?'}... @ ${msg.endpoint || '?'} — upgrade this peer; the crypto handshake will become mandatory`)
               const conn = this.acceptPeer(ws, msg.pubkey, msg.endpoint)
               if (conn) {
+                releasePreAuth()
                 if (opts.pubkeyHex && opts.endpoint) {
                   ws.send(JSON.stringify({
                     type: 'hello',

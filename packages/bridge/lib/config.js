@@ -46,13 +46,15 @@ export async function initConfig (dir = DEFAULT_DIR, opts = {}) {
     endpoint,
     meshId: '70016',
     capabilities: ['tx_relay', 'header_sync', 'broadcast', 'address_history'],
-    spvEndpoint: 'https://relay.indelible.one',
+    spvEndpoint: '', // operator-supplied SPV/registry endpoint; empty = registry peer discovery disabled (fails closed, never a default host)
+    crawlerUrl: '', // operator-supplied DNS-seed-crawler endpoint (/api/crawler/peers); empty = off
     apiKey: '',
     port: 8333,
     statusPort: 9333,
     statusSecret: randomBytes(32).toString('hex'),
     dataDir: join(dir, 'data'),
     seedPeers: [],
+    personal: opts.personal === true,
     // apps: [
     //   {
     //     name: 'My App',
@@ -75,9 +77,30 @@ export async function initConfig (dir = DEFAULT_DIR, opts = {}) {
  * @param {string} [dir] — Config directory (default: ~/.relay-bridge)
  * @returns {Promise<object>}
  */
+/**
+ * Validate config field types at load time — catch a hand-edited malformed config loudly
+ * instead of at a later precedence-check site. Only checks fields that are present.
+ */
+export function validateConfig (config) {
+  if (Object.prototype.hasOwnProperty.call(config, 'personal') &&
+      typeof config.personal !== 'boolean') {
+    throw new TypeError(`config.personal must be boolean (got ${typeof config.personal})`)
+  }
+  if (Object.prototype.hasOwnProperty.call(config, 'startGossipListener') &&
+      typeof config.startGossipListener !== 'boolean') {
+    throw new TypeError(`config.startGossipListener must be boolean (got ${typeof config.startGossipListener})`)
+  }
+  if (Object.prototype.hasOwnProperty.call(config, 'statusBindAddress') &&
+      typeof config.statusBindAddress !== 'string') {
+    throw new TypeError(`config.statusBindAddress must be string (got ${typeof config.statusBindAddress})`)
+  }
+}
+
 export async function loadConfig (dir = DEFAULT_DIR) {
   const raw = await readFile(join(dir, CONFIG_FILE), 'utf8')
-  return JSON.parse(raw)
+  const config = JSON.parse(raw)
+  validateConfig(config)
+  return config
 }
 
 /**

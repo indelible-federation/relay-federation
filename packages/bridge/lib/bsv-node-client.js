@@ -138,10 +138,9 @@ export class BSVNodeClient extends EventEmitter {
     this._baseCooldownMs = 30000       // 30s initial cooldown
     this._maxCooldownMs = 1800000      // 30 min cap (prevents refreshing 24hr bans on BSV nodes)
 
-    // g-205: size-capped LRU Maps replace unbounded Sets to prevent V8 heap leak
-    // under sustained peer-discovery load (e.g. bridge-7 hosting bsv-seed).
+    // Size-capped LRU Maps replace unbounded Sets to prevent a V8 heap leak under sustained
+    // peer-discovery load (e.g. a node also running a DNS-seed crawler).
     // Eviction is LRU-on-write only — see _addrPoolAdd / _blacklistAdd / _blacklistHas.
-    // Pack-reviewed across 3 rounds (txids 97a45976..., b1ee42fd..., 392879ad...).
 
     // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect.
     // Map: host → bannedAt ms.
@@ -206,7 +205,7 @@ export class BSVNodeClient extends EventEmitter {
     }
   }
 
-  // ─── g-205 size-capped LRU helpers ──────────────────────────────────────
+  // ─── size-capped LRU helpers ──────────────────────────────────────
   // Mirrors tx-relay.js Map-as-LRU pattern. Both Maps use insertion-order as
   // recency. delete-then-set on add promotes existing key to the tail
   // (most-recent). Eviction removes the head (oldest). Eviction is write-only

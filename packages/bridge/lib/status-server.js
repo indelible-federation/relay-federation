@@ -1,5 +1,7 @@
 import os from 'node:os'
 import { createServer } from 'node:http'
+import { isIP } from 'node:net'
+import dns from 'node:dns/promises'
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -27,6 +29,46 @@ export async function arcRelayed (arcRes) {
   return !!(d && ARC_NETWORK_STATUSES.has(d.txStatus))
 }
 
+// Raw-tx hex is ~2x the tx byte size; broadcast routes accept a larger body than control routes.
+const STATUS_BROADCAST_MAX_BYTES = 24 * 1024 * 1024
+const BROADCAST_RATE_MAX = 30          // requests per IP
+const BROADCAST_RATE_WINDOW_MS = 60_000
+
+// ARC / node / WoC "already known" phrasings — a duplicate broadcast is a SUCCESS, not a failure
+// (a false 502 here makes a client rebuild a tx on the same inputs → real double-spends).
+const TX_ALREADY_KNOWN_RE = /transaction already in the (mempool|block ?chain)|already in the (mempool|block ?chain)|txn-already-in-mempool|txn-already-known/i
+
+// SSRF guard for /mesh/proxy: reject private / loopback / link-local / ULA / CGNAT / multicast /
+// unspecified targets (v4 + v6). The mesh proxies READ-ONLY bridge endpoints, which are public IPs —
+// nothing legitimate resolves into these ranges.
+function isBlockedIp (ip) {
+  const a = String(ip).replace(/^::ffff:/i, '')
+  const kind = isIP(a)
+  if (kind === 4) {
+    const o = a.split('.').map(Number)
+    if (o.length !== 4 || o.some(n => !Number.isInteger(n))) return true
+    if (o[0] === 0 || o[0] === 10 || o[0] === 127) return true
+    if (o[0] === 169 && o[1] === 254) return true            // link-local
+    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true // RFC1918
+    if (o[0] === 192 && o[1] === 168) return true            // RFC1918
+    if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true // CGNAT
+    if (o[0] >= 224) return true                             // multicast / reserved
+    return false
+  }
+  if (kind === 6) {
+    const lo = a.toLowerCase()
+    // Allow ONLY global-unicast 2000::/3 (first hextet 2 or 3); block ::1, ::, link-local
+    // fe80::/10, ULA fc00::/7, multicast, etc.
+    if (!/^[23]/.test(lo)) return true
+    // 6to4 and Teredo live INSIDE global unicast and tunnel an embedded IPv4, so a
+    // 2002:7f00:1:: / 2001:0::7f00:1 can reach private space — block both.
+    if (lo.startsWith('2002:')) return true   // 6to4 (2002::/16)
+    if (/^2001:0*:/.test(lo)) return true     // Teredo (2001:0::/32)
+    return false
+  }
+  return true // not a valid IP literal → block
+}
+
 /**
  * StatusServer — public-facing HTTP server exposing bridge status and APIs.
  *
@@ -47,6 +89,11 @@ export async function arcRelayed (arcRes) {
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const DASHBOARD_HTML = readFileSync(join(__dirname, '..', 'dashboard', 'index.html'), 'utf8')
 const PKG_VERSION = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version
+// The operator dashboard holds the statusSecret, so keep executable JS same-origin.
+// script-src 'self' means no third-party CDN can run code in this origin (three.js is vendored to /vendor/).
+// 'unsafe-inline' stays for now because the dashboard is inline-script/handler heavy; connect-src allows
+// http(s) so the multi-bridge mesh view still reaches operator-configured bridge URLs.
+const DASHBOARD_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
 export class StatusServer {
   /**
    * @param {object} opts
@@ -321,15 +368,72 @@ export class StatusServer {
    * @param {import('node:http').IncomingMessage} req
    * @returns {Promise<object>}
    */
-  _readBody (req) {
+  // Bound the request body so a caller can't OOM the process. Control routes default to
+  // 256 KiB; broadcast routes pass STATUS_BROADCAST_MAX_BYTES (raw tx hex).
+  _readBody (req, maxBytes = 262144) {
     return new Promise((resolve, reject) => {
-      let body = ''
-      req.on('data', chunk => { body += chunk })
-      req.on('end', () => {
-        try { resolve(body ? JSON.parse(body) : {}) } catch (e) { reject(e) }
+      const chunks = []
+      let size = 0
+      let done = false
+      const settle = (fn, arg) => { if (done) return; done = true; fn(arg) }
+      req.on('data', chunk => {
+        if (done) return
+        size += chunk.length
+        if (size > maxBytes) {
+          const err = new Error('request body too large'); err.statusCode = 413
+          try { req.destroy() } catch { /* already gone */ }
+          settle(reject, err)
+          return
+        }
+        chunks.push(chunk)
       })
-      req.on('error', reject)
+      req.on('end', () => {
+        // Buffer accumulation + single decode — avoids mis-decoding a multi-byte UTF-8 char
+        // split across chunks (the string-concat path could).
+        try { const body = Buffer.concat(chunks).toString('utf8'); settle(resolve, body ? JSON.parse(body) : {}) } catch (e) { settle(reject, e) }
+      })
+      req.on('error', (e) => settle(reject, e))
+      // settle-once guard + reject on a premature close, so a dropped connection can't leave
+      // this Promise (and its request handler) hanging forever.
+      req.on('close', () => settle(reject, new Error('connection closed before body completed')))
     })
+  }
+
+  // Tiny per-IP sliding-window limiter for abuse-prone open routes (broadcast relay). Bounded:
+  // prunes each IP's window on access, and caps the tracked-IP map.
+  _rateLimit (req, bucket, max, windowMs) {
+    if (!this._rateBuckets) this._rateBuckets = new Map()
+    let m = this._rateBuckets.get(bucket)
+    if (!m) { m = new Map(); this._rateBuckets.set(bucket, m) }
+    const ip = req.socket && req.socket.remoteAddress
+    if (!ip) return false // no identifiable source IP → fail closed, don't collapse into one shared bucket
+    const now = Date.now()
+    const floor = now - windowMs
+    const hits = (m.get(ip) || []).filter(t => t > floor)
+    if (hits.length >= max) { m.set(ip, hits); return false }
+    hits.push(now)
+    m.set(ip, hits)
+    if (m.size > 5000) { for (const [k, v] of m) { if (!v.length || v[v.length - 1] <= floor) m.delete(k) } }
+    return true
+  }
+
+  // Shared broadcast-body gate (jury refinement): ONE size-cap + rate-limit path for BOTH
+  // /broadcast and /api/broadcast, so the two routes can't drift. Returns the parsed body, or
+  // null after having already sent a 429 / 413 response (caller must return on null).
+  async _readBroadcastBody (req, res) {
+    if (!this._rateLimit(req, 'broadcast', BROADCAST_RATE_MAX, BROADCAST_RATE_WINDOW_MS)) {
+      res.writeHead(429, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'rate limit exceeded' }))
+      return null
+    }
+    try {
+      return await this._readBody(req, STATUS_BROADCAST_MAX_BYTES)
+    } catch (e) {
+      const code = e && e.statusCode === 413 ? 413 : 400
+      res.writeHead(code, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: code === 413 ? 'request body too large' : 'invalid request body' }))
+      return null
+    }
   }
 
   /**
@@ -705,31 +809,105 @@ export class StatusServer {
 
     // GET /mesh/proxy?url=... — proxy requests to other bridges (avoids mixed-content when dashboard is HTTPS)
     if (req.method === 'GET' && path === '/mesh/proxy') {
+      // Unauthenticated public proxy — rate-limit per IP so a flood of concurrent requests
+      // (each buffering up to the response cap) can't pressure memory.
+      if (!this._rateLimit(req, 'proxy', 60, 60_000)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'rate limited' }))
+        return
+      }
       const targetUrl = url.searchParams.get('url')
       if (!targetUrl) {
         res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         res.end(JSON.stringify({ error: 'Missing url parameter' }))
         return
       }
-      // Only allow proxying to read-only mesh endpoints
-      try {
-        const t = new URL(targetUrl)
-        const allowedPrefixes = ['/status', '/mempool', '/discover', '/tx/', '/address/', '/inscriptions', '/tokens', '/token/', '/apps', '/x402', '/proof/', '/api/crawler/', '/health']
-        if (!allowedPrefixes.some(p => t.pathname === p || t.pathname.startsWith(p))) {
-          res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-          res.end(JSON.stringify({ error: 'Path not allowed through proxy' }))
-          return
-        }
-      } catch {
+      let t
+      try { t = new URL(targetUrl) } catch {
         res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         res.end(JSON.stringify({ error: 'Invalid URL' }))
         return
       }
+      // scheme allowlist — block file://, gopher://, etc.
+      if (t.protocol !== 'http:' && t.protocol !== 'https:') {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Scheme not allowed' }))
+        return
+      }
+      // Only allow proxying to read-only mesh endpoints (path allowlist)
+      const allowedPrefixes = ['/status', '/mempool', '/discover', '/tx/', '/address/', '/inscriptions', '/tokens', '/token/', '/apps', '/x402', '/proof/', '/api/crawler/', '/health']
+      if (!allowedPrefixes.some(p => t.pathname === p || t.pathname.startsWith(p))) {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Path not allowed through proxy' }))
+        return
+      }
+      // SSRF: resolve the host, reject private/loopback/link-local targets, and PIN the
+      // connection to the validated IP so a DNS rebind can't swap in an internal address
+      // between check and connect.
+      const host = t.hostname.replace(/^\[|\]$/g, '')
+      let addrs
       try {
-        const proxyRes = await fetch(targetUrl, { signal: AbortSignal.timeout(8000) })
-        const body = await proxyRes.text()
-        res.writeHead(proxyRes.status, { 'Content-Type': proxyRes.headers.get('content-type') || 'application/json', 'Access-Control-Allow-Origin': '*' })
-        res.end(body)
+        addrs = isIP(host) ? [{ address: host, family: isIP(host) }] : await dns.lookup(host, { all: true })
+      } catch {
+        res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Host resolution failed' }))
+        return
+      }
+      if (!addrs.length || addrs.some(a => isBlockedIp(a.address))) {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Target host not allowed' }))
+        return
+      }
+      // https can't be safely IP-pinned via fetch (the cert binds to the name, so we'd have to
+      // re-resolve at connect — a rebind window). Mesh endpoints are http-by-IP, so reject an
+      // https target that uses a hostname.
+      if (!isIP(host) && t.protocol === 'https:') {
+        res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'https proxy target must be an IP' }))
+        return
+      }
+      // Pin: for hostname targets over http (mesh endpoints are http), connect to the validated
+      // IP with the original Host header. IP-literal targets are already pinned (no resolution).
+      let fetchUrl = targetUrl
+      // redirect:'manual' — fetch follows 3xx by default, so a validated target could 302 us to
+      // an internal address, bypassing the IP checks. Don't follow; relay the redirect response
+      // as-is (mesh endpoints return data directly, never redirect).
+      const fetchOpts = { signal: AbortSignal.timeout(8000), redirect: 'manual' }
+      if (!isIP(host) && t.protocol === 'http:') {
+        const a0 = addrs[0]
+        const ipHost = a0.family === 6 ? `[${a0.address}]` : a0.address
+        const u2 = new URL(targetUrl); u2.hostname = ipHost
+        fetchUrl = u2.toString()
+        // t.host is already URL-validated (no CRLF/control chars); allowlist-sanitize as
+        // belt-and-suspenders before forwarding it as the upstream Host header.
+        if (/^[a-z0-9.\-:[\]]+$/i.test(t.host)) fetchOpts.headers = { Host: t.host }
+      }
+      try {
+        const proxyRes = await fetch(fetchUrl, fetchOpts)
+        // Bound the UPSTREAM response — a hostile/compromised target could otherwise stream an
+        // unbounded body we'd buffer whole. Read with a 4 MiB cap, cancel if over.
+        const MAX_PROXY_RESP = 4 * 1024 * 1024
+        const parts = []
+        let received = 0
+        let over = false
+        const reader = proxyRes.body && proxyRes.body.getReader ? proxyRes.body.getReader() : null
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            received += value.length
+            if (received > MAX_PROXY_RESP) { over = true; try { await reader.cancel() } catch {} ; break }
+            parts.push(Buffer.from(value))
+          }
+        }
+        if (over) {
+          res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+          res.end(JSON.stringify({ error: 'upstream response too large' }))
+          return
+        }
+        // nosniff so the reflected upstream content-type can't be sniffed into something executable.
+        res.writeHead(proxyRes.status, { 'Content-Type': proxyRes.headers.get('content-type') || 'application/json', 'X-Content-Type-Options': 'nosniff', 'Access-Control-Allow-Origin': '*' })
+        res.end(Buffer.concat(parts))
       } catch (err) {
         res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         res.end(JSON.stringify({ error: 'Proxy fetch failed', message: err.message }))
@@ -739,7 +917,7 @@ export class StatusServer {
 
     // GET / or /dashboard — built-in HTML dashboard
     if (req.method === 'GET' && (path === '/' || path === '/dashboard')) {
-      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Security-Policy': DASHBOARD_CSP })
       res.end(DASHBOARD_HTML)
       return
     }
@@ -765,9 +943,30 @@ export class StatusServer {
       return
     }
 
+    // GET /vendor/:filename — locally-vendored dashboard libraries (three.js, OrbitControls).
+    // Vendored so the credential-bearing dashboard origin never loads executable JS from a third-party CDN.
+    if (req.method === 'GET' && path.startsWith('/vendor/')) {
+      const filename = path.slice(8)
+      if (filename.includes('..') || filename.includes('/') || !filename.endsWith('.js')) {
+        res.writeHead(400)
+        res.end('Bad request')
+        return
+      }
+      try {
+        const data = readFileSync(join(__dirname, '..', 'dashboard', 'vendor', filename))
+        res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'public, max-age=86400' })
+        res.end(data)
+      } catch {
+        res.writeHead(404)
+        res.end('Not found')
+      }
+      return
+    }
+
     // POST /broadcast — relay a raw tx to peers (uses same waterfall as /api/broadcast)
     if (req.method === 'POST' && path === '/broadcast') {
-      const body = await this._readBody(req)
+      const body = await this._readBroadcastBody(req, res)
+      if (body === null) return
       const { rawHex } = body
       if (!rawHex || typeof rawHex !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -811,8 +1010,15 @@ export class StatusServer {
             body: JSON.stringify({ txhex: rawHex }), signal: AbortSignal.timeout(10000)
           })
           if (wocRes.ok) { confirmed = true; confirmSource = 'woc' }
+          else {
+            // A duplicate ("already in the mempool/blockchain") is a SUCCESS, not a failure —
+            // else the client rebuilds a tx on the same inputs and creates a real double-spend.
+            const wocErr = await wocRes.text().catch(() => '')
+            if (TX_ALREADY_KNOWN_RE.test(wocErr)) { confirmed = true; confirmSource = 'woc-already-known' }
+          }
         } catch (e) {
           console.error('[broadcast] WoC failed:', txid.slice(0, 16), e.message)
+          if (TX_ALREADY_KNOWN_RE.test(e.message || '')) { confirmed = true; confirmSource = 'woc-already-known' }
         }
       }
 
@@ -1803,7 +2009,8 @@ export class StatusServer {
 
     // POST /api/broadcast — MCP/CLI compatibility (accepts { rawTx } key)
     if (req.method === 'POST' && path === '/api/broadcast') {
-      const body = await this._readBody(req)
+      const body = await this._readBroadcastBody(req, res)
+      if (body === null) return
       const rawHex = body.rawTx || body.rawHex
       if (!rawHex || typeof rawHex !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -1882,10 +2089,13 @@ export class StatusServer {
             confirmSource = 'woc'
           } else {
             const wocErr = await wocRes.text().catch(() => '')
-            console.error('[broadcast] WoC rejected:', txid.slice(0, 16), wocRes.status, wocErr.slice(0, 200))
+            // A duplicate ("already in the mempool/blockchain") is a SUCCESS, not a failure.
+            if (TX_ALREADY_KNOWN_RE.test(wocErr)) { confirmed = true; confirmSource = 'woc-already-known' }
+            else console.error('[broadcast] WoC rejected:', txid.slice(0, 16), wocRes.status, wocErr.slice(0, 200))
           }
         } catch (e) {
           console.error('[broadcast] WoC failed:', txid.slice(0, 16), e.message)
+          if (TX_ALREADY_KNOWN_RE.test(e.message || '')) { confirmed = true; confirmSource = 'woc-already-known' }
         }
       }
 
