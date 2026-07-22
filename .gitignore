@@ -21,3 +21,31 @@ packages/bridge/briefing.md
 packages/bridge/cli.js.*-live
 packages/bridge/cli.js.alpha-good
 packages/bridge/cli.js.*.bak.*
+
+# --- 2026-06-16 stray-file triage — keep Indelible/private out of the public repo ---
+# Private fleet-ops docs (leak fleet IPs / mesh / repo-split glue). Moved to
+# c:/indelible-docs/relay-fleet-ops/; patterns kept as a backstop against re-drops.
+BRIDGE_RECOVERY_PROCEDURES.md
+bridgesecurity414.md
+SERVER_RESTART_HANDBOOK.md
+P2P_PEER_RETENTION_PLAN.md
+dashboard-v4-3d-backup.html
+codex-*.md
+plans/
+packages/seed/
+
+# Local-only working docs — kept in this clone, never pushed.
+CRAWLER_HANDBOOK.md
+relay-bridge.service
+SPV_MEMPOOL_PLAN.md
+TERANODE_INTEGRATION_HANDBOOK.md
+arc-vs-federation-article.md
+PR1-review.md
+resume-zcool.md
+
+# Junk / scratch / binaries — never belong in the repo.
+*.exe
+*.zip
+*-backup.html
+tmp-*
+/art/        # root scratch art (15MB screenshots) — NOT packages/bridge/dashboard/art/ (legit dashboard assets)
